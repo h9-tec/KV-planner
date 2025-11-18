@@ -1,0 +1,21 @@
+{
+  "overall_accuracy": -889125.6591166642,
+  "mean_error_pct": 889225.6591166642,
+  "max_error_pct": 889225.6591166642,
+  "systematic_bias": "overestimate",
+  "passed": false,
+  "comparisons": [
+    {
+      "metric": "Throughput (tok/s)",
+      "predicted": 3557.3026364666575,
+      "actual": 0.4,
+      "error_pct": -889225.6591166642,
+      "within_tolerance": false
+    }
+  ],
+  "tuning_suggestions": [
+    "Throughput overestimated by 889225.7%. Consider reducing MFU/MBU estimates in roofline model.",
+    "Systematic overestimation detected across metrics. Consider adjusting baseline efficiency assumptions upward.",
+    "Maximum error is 889225.7%, indicating model limitations. Consider validating hardware specs and model architecture assumptions."
+  ]
+}

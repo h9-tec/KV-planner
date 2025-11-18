@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:docs.vllm.ai)",
+      "WebFetch(domain:github.com)",
+      "Bash(python -m pytest:*)",
+      "Bash(python3 -m pytest:*)",
+      "WebFetch(domain:www.techpowerup.com)",
+      "Bash(python3:*)",
+      "Bash(pip install:*)",
+      "Bash(PYTHONPATH=/home/hesham-haroun/kv-planner/src python3:*)",
+      "WebFetch(domain:www.notebookcheck.net)",
+      "WebFetch(domain:arxiv.org)",
+      "WebFetch(domain:kipp.ly)",
+      "Bash(find:*)",
+      "Bash(xargs rm:*)",
+      "Bash(PYTHONPATH=./src python3:*)",
+      "Bash(source:*)",
+      "Bash(kv-planner:*)",
+      "WebFetch(domain:medium.com)",
+      "Bash(nvidia-smi:*)",
+      "Bash(python:*)",
+      "Bash(vllm:*)",
+      "Bash(cat:*)",
+      "Bash(curl:*)",
+      "Bash(chmod:*)",
+      "Bash(./test_simple.sh)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
