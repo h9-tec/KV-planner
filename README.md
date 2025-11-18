@@ -67,7 +67,7 @@ src/kv_planner/
 
 ```bash
 # Clone repository
-git clone https://github.com/yourusername/kv-planner.git
+git clone https://github.com/h9-tec/KV-planner.git
 cd kv-planner
 
 # Install with pip
@@ -246,12 +246,30 @@ print(f"  --gpu-memory-utilization {vllm_config['gpu_memory_utilization']}")
 
 ### Roofline Analysis
 
-kv-planner implements compute-memory roofline analysis to identify bottlenecks:
+kv-planner implements the Roofline performance model (Williams et al., 2009) to characterize compute-memory bottlenecks in LLM inference:
 
-- **Prefill Phase**: Typically compute-bound (high arithmetic intensity)
-- **Decode Phase**: Typically memory-bound (low arithmetic intensity)
-- **MFU (Model FLOPS Utilization)**: Achieved FLOPS / Peak FLOPS
-- **MBU (Memory Bandwidth Utilization)**: Achieved bandwidth / Peak bandwidth
+**Theoretical Foundation:**
+- **Arithmetic Intensity (AI)**: FLOP/byte ratio = `Total FLOPS / Memory Bytes Transferred`
+- **Roofline Bound**: `Performance = min(Peak FLOPS, AI × Peak Bandwidth)`
+- **Bottleneck Detection**: Compare AI against ridge point (`Peak FLOPS / Peak Bandwidth`)
+
+**LLM Inference Characteristics:**
+
+1. **Prefill Phase** (Compute-Bound):
+   - High arithmetic intensity: `AI ≈ 2 × seq_len / (model_bytes)`
+   - Batch matrix multiplications dominate
+   - **MFU (Model FLOPS Utilization)**: `Achieved TFLOPS / Peak TFLOPS`
+   - Typical MFU: 40-60% for optimized implementations
+
+2. **Decode Phase** (Memory-Bound):
+   - Low arithmetic intensity: `AI ≈ 2 / (model_bytes)` per token
+   - Memory bandwidth saturated by weight loading
+   - **MBU (Memory Bandwidth Utilization)**: `Achieved GB/s / Peak GB/s`
+   - Typical MBU: 60-80% (limited by HBM bandwidth)
+
+**Optimization Implications:**
+- Prefill: Increase batch size, use tensor cores (FP16/BF16/FP8)
+- Decode: Quantization (reduce memory footprint), speculative decoding, KV cache compression
 
 ### Laptop GPU Adjustments
 
@@ -266,13 +284,31 @@ Laptop GPUs experience significant performance degradation vs desktop counterpar
 
 **Validation**: RTX 5060 Laptop achieved 255.63 tok/s vs predicted 3,557 tok/s (desktop baseline), validating 7.2% retention factor.
 
-### Memory Fragmentation
+### Memory Fragmentation Analysis
 
-PagedAttention achieves <4% fragmentation:
+**Problem:** Naive KV cache allocation pre-reserves memory for maximum sequence length, causing severe fragmentation.
 
-- **Block-based allocation**: 16-token blocks with dynamic assignment
-- **Naive allocation**: 60-80% fragmentation due to max sequence length pre-allocation
-- **Savings**: 15-20x more concurrent requests with same memory
+**Mathematical Analysis:**
+```
+Naive Memory = num_requests × max_seq_len × kv_cache_per_token
+Actual Usage = Σ(actual_seq_len_i × kv_cache_per_token)
+Fragmentation = 1 - (Actual Usage / Naive Memory)
+```
+
+For variable-length workloads with `avg_len = 512`, `max_len = 4096`:
+- Naive fragmentation: `1 - (512/4096) = 87.5%`
+- Wasted memory: 7/8 of allocation
+
+**PagedAttention Solution** (Kwon et al., 2023):
+- **Block-based allocation**: Divide sequences into fixed blocks (e.g., 16 tokens)
+- **Dynamic assignment**: Allocate blocks on-demand, non-contiguous in physical memory
+- **Virtual addressing**: Logical sequence ↔ physical block mapping via indirection table
+
+**Performance Characteristics:**
+- Fragmentation: <4% (empirically measured)
+- Memory savings: 15-20× for typical workloads
+- Overhead: Minimal indirection cost (<1% latency impact)
+- Throughput improvement: 2.2× higher than naive allocation (vLLM paper)
 
 ## GPU Hardware Database
 
@@ -421,24 +457,24 @@ make ci
 
 ### Roadmap 🚀
 
-#### Phase 5: Advanced Features
-- Multi-modal models (LLaVA, Qwen-VL)
-- Mixture-of-Experts optimization (Mixtral, DeepSeek-V2)
-- Disaggregated serving analysis (prefill/decode separation)
-- Speculative decoding modeling
+#### Phase 5: Advanced Features (Planned)
+- [ ] Multi-modal models (LLaVA, Qwen-VL)
+- [ ] Mixture-of-Experts optimization (Mixtral, DeepSeek-V2)
+- [ ] Disaggregated serving analysis (prefill/decode separation)
+- [ ] Speculative decoding modeling
 
-#### Phase 6: Production Enhancements
-- Spot instance pricing optimization
-- Multi-region cost comparison
-- Auto-tuning based on benchmark feedback
-- TensorRT-LLM config generation
-- LMCache config generation
+#### Phase 6: Production Enhancements (Planned)
+- [ ] Spot instance pricing optimization
+- [ ] Multi-region cost comparison
+- [ ] Auto-tuning based on benchmark feedback
+- [ ] TensorRT-LLM config generation
+- [ ] LMCache config generation
 
-#### Phase 7: User Experience
-- Web UI with interactive planning
-- Real-time cost monitoring
-- Alert system for over/under-utilization
-- Deployment health checks
+#### Phase 7: User Experience (Planned)
+- [ ] Web UI with interactive planning
+- [ ] Real-time cost monitoring
+- [ ] Alert system for over/under-utilization
+- [ ] Deployment health checks
 
 ## Contributing
 
@@ -454,7 +490,7 @@ Contributions are welcome! Please follow these guidelines:
 
 ```bash
 # Fork repository
-git clone https://github.com/yourusername/kv-planner.git
+git clone https://github.com/h9-tec/KV-planner.git
 
 # Create feature branch
 git checkout -b feature/your-feature
@@ -482,9 +518,9 @@ If you use kv-planner in your research or production systems, please cite:
 ```bibtex
 @software{kv_planner,
   title = {kv-planner: Production-grade KV cache planning for LLM deployment},
-  author = {Your Name},
+  author = {Hesham Haroon},
   year = {2025},
-  url = {https://github.com/yourusername/kv-planner}
+  url = {https://github.com/h9-tec/KV-planner}
 }
 ```
 
@@ -496,18 +532,19 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 kv-planner builds upon research and insights from:
 
-- **vLLM** (Kwon et al., 2023): PagedAttention and block-based memory management
-- **LMCache** (Liu et al., 2024): KV cache sharing and offloading strategies
-- **DistServe** (Zhong et al., 2024): Disaggregated prefill/decode serving
-- **FlashAttention** (Dao et al., 2022): Memory-efficient attention computation
-- **StreamingLLM** (Xiao et al., 2023): Attention sink analysis
-- **Roofline Model** (Williams et al., 2009): Performance characterization methodology
+- **vLLM** (Kwon et al., 2023): [Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180)
+- **FlashAttention** (Dao et al., 2022): [FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness](https://arxiv.org/abs/2205.14135)
+- **Roofline Model** (Williams et al., 2009): [Roofline: An Insightful Visual Performance Model for Multicore Architectures](https://dl.acm.org/doi/10.1145/1498765.1498785)
+- **LMCache** (Liu et al., 2024): [LMCache: Fast and Flexible Caching for Large Language Model Inference](https://arxiv.org/abs/2402.04315)
+- **DistServe** (Zhong et al., 2024): [DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving](https://arxiv.org/abs/2401.09670)
+- **StreamingLLM** (Xiao et al., 2023): [Efficient Streaming Language Models with Attention Sinks](https://arxiv.org/abs/2309.17453)
 
 ## Contact
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/kv-planner/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/kv-planner/discussions)
-- **Email**: your.email@example.com
+- **GitHub**: [h9-tec/KV-planner](https://github.com/h9-tec/KV-planner)
+- **Issues**: [GitHub Issues](https://github.com/h9-tec/KV-planner/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/h9-tec/KV-planner/discussions)
+- **Email**: heshamharoon19@gmail.com
 
 ---
 

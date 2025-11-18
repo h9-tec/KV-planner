@@ -27,7 +27,15 @@
       "Bash(chmod:*)",
       "Bash(./test_simple.sh)",
       "Bash(git init:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git branch:*)",
+      "Bash(git remote add:*)",
+      "Bash(git push:*)",
+      "Bash(ssh:*)",
+      "Bash(ssh-keyscan:*)",
+      "Bash(~/.ssh/known_hosts)",
+      "Bash(git remote:*)"
     ],
     "deny": [],
     "ask": []
