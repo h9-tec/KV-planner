@@ -47,6 +47,7 @@ dmypy.json
 *.swo
 *~
 .DS_Store
+.claude/
 
 # Documentation
 docs/_build/
