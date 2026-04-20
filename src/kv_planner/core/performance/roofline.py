@@ -87,20 +87,20 @@ def flops_per_token_per_layer(model: ModelConfig, sequence_length: int) -> int:
 
     * Q projection: ``2·d·d``
     * K, V projections (GQA-aware): ``2·d·kv_hidden`` each
-    * Attention scores Q·Kᵀ: ``2·d·s`` (one new query token vs s past tokens,
-      GQA replicates K across the group so the query-head count applies)
+    * Attention scores Q·Kᵀ: ``2·d·s``
     * Attention Aᵀ·V: ``2·d·s``
     * Output projection: ``2·d·d``
     * FFN: ``n_matmuls · 2·d·d_ff``  (n_matmuls = 3 for SwiGLU, else 2)
 
-    ``sequence_length`` is the **current position** — pass the accumulated
-    context length for a decode step, or the prompt length for prefill.
+    **MoE models** (``is_moe=True``): FFN is multiplied by
+    ``num_experts_per_token``, not by ``num_experts`` — only the activated
+    experts do the work for a given token. Mixtral-8x7B with top-2 routing
+    runs ~2×d·d_ff FFN FLOPs per token, not 8×. This reduces the FFN term
+    by ``num_experts / num_experts_per_token`` (4× for Mixtral, 8× for
+    DeepSeek-V3 which is top-8 out of 256 plus shared experts).
 
-    For prefill of a whole prompt of length ``s``, sum from 1 to s; the
-    closed-form is the per-token formula with ``s/2`` in the attention term
-    (arithmetic mean of positions). We approximate by evaluating at ``s``
-    and noting that for compute-bound prefill the attention term is
-    negligible relative to the 24·d² matmul bulk.
+    ``sequence_length`` is the **current position** — pass the accumulated
+    context for decode, prompt length for prefill.
     """
     d = model.hidden_size
     d_kv = model.kv_hidden_size
@@ -112,6 +112,8 @@ def flops_per_token_per_layer(model: ModelConfig, sequence_length: int) -> int:
     attn_qk = 2 * d * sequence_length
     attn_v = 2 * d * sequence_length
     ffn = n_matmuls * 2 * d * d_ff
+    if model.is_moe and model.num_experts_per_token is not None:
+        ffn *= model.num_experts_per_token
 
     return q_o + kv_proj + attn_qk + attn_v + ffn
 
@@ -277,15 +279,22 @@ class RooflineAnalyzer:
         (i.e., input_length + number_of_tokens_already_generated). Callers
         that want an average across an output run should integrate across
         ``range(input_length, input_length + output_length)``.
+
+        **MoE models:** decode streams ``active_params`` bytes per token,
+        not ``total_params``. With a good expert-parallel kernel (vLLM EP,
+        SGLang) only activated experts are loaded from HBM. Dense models'
+        ``active_params == total_params`` so the math is unchanged.
         """
         bpe = bytes_per_element(precision)
 
         flops_per_step = self.calculate_flops_per_token(model, sequence_length) * batch_size
 
-        param_bytes = model.total_params() * bpe
+        # Active parameters flow through HBM per decode step; total
+        # parameters occupy VRAM but need not be read every token (for MoE).
+        active_param_bytes = model.active_params() * bpe
         # **Bug-fix anchor**: reads the FULL growing KV cache, not one token's worth.
         kv_bytes = model.kv_cache_bytes_per_token(precision) * batch_size * sequence_length
-        total_bytes = param_bytes + kv_bytes
+        total_bytes = active_param_bytes + kv_bytes
 
         bw_time = total_bytes / (
             hardware.memory_bandwidth_gb_s * 1e9 * self._config.memory_efficiency

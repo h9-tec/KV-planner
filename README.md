@@ -14,8 +14,9 @@ principles, with a formula and a citation for every number.
 > against published literature. End-to-end predictions have so far been
 > validated on a single laptop GPU (RTX 5060 Laptop) running Ollama —
 > enterprise GPU validation (H100, A100, MI300X) is on the roadmap but not
-> done yet. See [Honest limitations](#honest-limitations) below before
-> sizing a production cluster based solely on kv-planner's output.
+> done yet. See [`BENCHMARKS.md`](BENCHMARKS.md) for the honest validation
+> ledger and [Honest limitations](#honest-limitations) below before sizing
+> a production cluster based solely on kv-planner's output.
 
 ![kv-planner native GUI](docs/screenshots/gui-01-overview.png)
 
@@ -89,6 +90,7 @@ explain every recommendation.
 | Multi-GPU fleet sizer | ✓ | ✗ | ✗ | ✗ | ✗ |
 | Training / fine-tune planner | ✓ | ✗ | ~ (FT calc) | ✓ (estimate-memory) | ✗ |
 | Speculative-decoding physics | ✓ | ✗ | ✗ | ✗ | (runs it) |
+| MoE active vs total params (Mixtral/Qwen3-MoE/DeepSeek-V2) | ✓ | partial | ✗ | ✗ | (runs it) |
 | Reasoning-model KV (thinking tokens) | ✓ | ✗ | ✗ | ✗ | ✗ |
 | Prefix-cache hit-rate model | ✓ | ✗ | ✗ | ✗ | ✗ |
 | Concurrent load tester (stdlib) | ✓ | ✗ | ✗ | ✗ | (LLMPerf) |
@@ -631,6 +633,7 @@ All 23 subcommands:
 | [`why`](#2-memory-waterfall-with-citations) | Memory waterfall — every term with formula + citation |
 | [`specdec`](#11-speculative-decoding) | Speculative-decoding speedup estimate (EAGLE-3/Medusa/Lookahead) |
 | [`reasoning`](#12-reasoning-model-kv-planner) | p99 KV for thinking-token workloads |
+| `moe-info` | Active vs total params for MoE models (Mixtral/Qwen3-MoE/DeepSeek) |
 | **Measurement loop** | |
 | [`loadtest`](#8-concurrent-load-testing--self-calibration) | Concurrent HTTP load generator with TTFT/TPOT/goodput |
 | [`sweep`](#8-concurrent-load-testing--self-calibration) | Concurrency ladder — finds the throughput knee |
@@ -854,6 +857,10 @@ src/kv_planner/
 | `phi-4-14b` | Microsoft | 14.7 B | general, reasoning, chat | MIT |
 | `aya-expanse-8b` | Cohere | 9.1 B | general, chat, multimodal | CC-BY-NC-4.0 |
 | `aya-expanse-35b` | Cohere | 34.4 B | general, chat, multimodal | CC-BY-NC-4.0 |
+| `mixtral-8x7b` (**MoE 2/8**) | Mistral AI | 46.7 B total / 12.9 B active | general, chat, coding | Apache-2.0 |
+| `qwen3-30b-a3b` (**MoE 8/128**) | Alibaba | 30.1 B / 2.9 B active | general, reasoning, coding | Apache-2.0 |
+| `qwen3-235b-a22b` (**MoE 8/128**) | Alibaba | 231.7 B / 18.8 B active | general, reasoning, coding | Apache-2.0 |
+| `deepseek-v2-lite` (**MoE 6/64**) | DeepSeek | 15.8 B / 2.3 B active | general, coding | MIT |
 
 Adding a model is ~10 lines in
 [`src/kv_planner/infrastructure/model_catalog.py`](src/kv_planner/infrastructure/model_catalog.py)

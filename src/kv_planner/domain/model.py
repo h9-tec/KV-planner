@@ -233,6 +233,41 @@ class ModelConfig:
             return int(round(self.hidden_size * 8 / 3 / 256) * 256)
         return 4 * self.hidden_size
 
+    def active_params(self) -> int:
+        """Parameters that fire during ONE forward pass.
+
+        For dense models this equals :meth:`total_params`. For MoE models
+        only ``num_experts_per_token`` expert slices of the FFN activate
+        per token — the other experts sit in VRAM but don't contribute to
+        FLOPs or decode memory bandwidth.
+
+        Use ``active_params()`` for FLOPs + memory-bandwidth math;
+        use ``total_params()`` for VRAM / weight-storage math.
+        """
+        hidden = self.hidden_size
+        layers = self.num_layers
+        vocab = self.vocab_size
+        kv_hidden = self.num_key_value_heads * self.head_dim
+
+        q_and_o = 2 * hidden * hidden
+        kv = 2 * hidden * kv_hidden
+        attn_params_per_layer = q_and_o + kv
+
+        d_ff = self._ffn_intermediate
+        if self.ffn_type == "swiglu":
+            ffn_params_per_layer = 3 * hidden * d_ff
+        else:
+            ffn_params_per_layer = 2 * hidden * d_ff
+
+        if self.is_moe and self.num_experts_per_token is not None:
+            # Active FFN = only the experts that the router picked.
+            ffn_params_per_layer *= self.num_experts_per_token
+
+        per_layer = attn_params_per_layer + ffn_params_per_layer
+        dense = layers * per_layer
+        embed_params = 2 * vocab * hidden  # untied input + output embeddings
+        return dense + embed_params
+
     def total_params(self) -> int:
         """
         Estimate total model parameters — GQA-aware.

@@ -346,6 +346,16 @@ def create_parser() -> argparse.ArgumentParser:
                               help="Force refresh from OpenRouter")
     price_parser.add_argument("--json", action="store_true")
 
+    # ----- moe-info (MoE active vs total params) -------------------------
+    moe_parser = subparsers.add_parser(
+        "moe-info",
+        help="Show active vs total params for an MoE model + decode-cost implications",
+    )
+    moe_parser.add_argument("--model", required=True)
+    moe_parser.add_argument("--gpu", help="Optional: fit check on a GPU")
+    moe_parser.add_argument("--precision", default="fp16")
+    moe_parser.add_argument("--json", action="store_true")
+
     # ----- mcp (Model Context Protocol server) ---------------------------
     mcp_parser = subparsers.add_parser(
         "mcp",
@@ -1018,6 +1028,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     elif args.command == "mcp":
         from kv_planner.mcp import main as mcp_main
         return mcp_main()
+    elif args.command == "moe-info":
+        return cmd_moe_info(args)
     else:
         print(f"Unknown command: {args.command}", file=sys.stderr)
         return 1
@@ -1251,6 +1263,71 @@ def cmd_explain(args: argparse.Namespace) -> int:
         for c in rat.caveats:
             print(f"    • {c}")
     print()
+    return 0
+
+
+def cmd_moe_info(args: argparse.Namespace) -> int:
+    """Show active vs total params for an MoE (or dense) model."""
+    from kv_planner.domain import bytes_per_element
+    from kv_planner.infrastructure.model_catalog import by_slug
+
+    entry = by_slug(args.model)
+    if entry is None:
+        print(f"Unknown model slug '{args.model}'.", file=sys.stderr)
+        return 1
+    cfg = entry.config
+    total = cfg.total_params()
+    active = cfg.active_params()
+    bpe = bytes_per_element(args.precision)
+    total_vram_gb = total * bpe / 1e9
+    active_bw_gb = active * bpe / 1e9
+
+    fits_gb = None
+    if args.gpu:
+        hw = GPUDatabase.get(args.gpu)
+        if hw:
+            fits_gb = hw.memory_gb
+
+    if args.json:
+        payload = {
+            "slug": entry.slug, "is_moe": cfg.is_moe,
+            "num_experts": cfg.num_experts,
+            "num_experts_per_token": cfg.num_experts_per_token,
+            "total_params": total, "active_params": active,
+            "activation_ratio": round(total / active, 2) if active > 0 else None,
+            "precision": args.precision,
+            "total_weight_bytes": total * bpe,
+            "active_bandwidth_per_step": active * bpe,
+            "weight_vram_gb": round(total_vram_gb, 2),
+            "decode_bandwidth_per_token_gb": round(active_bw_gb, 2),
+            "gpu_memory_gb": fits_gb,
+            "fits": (total_vram_gb <= fits_gb * 0.9) if fits_gb else None,
+        }
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    print()
+    if cfg.is_moe:
+        print(f"  {entry.slug}  ·  MoE  ·  routing top-{cfg.num_experts_per_token} / "
+              f"{cfg.num_experts}  ·  {args.precision}")
+    else:
+        print(f"  {entry.slug}  ·  dense  ·  {args.precision}")
+    print(f"  total params           {total/1e9:>8.2f} B      (all experts sit in VRAM)")
+    print(f"  active params          {active/1e9:>8.2f} B      (what fires per forward pass)")
+    if cfg.is_moe:
+        print(f"  activation ratio       {total/active:>8.2f} x")
+    print()
+    print(f"  weight VRAM @ {args.precision:<4}     {total_vram_gb:>8.2f} GB")
+    print(f"  decode HBM / step      {active_bw_gb:>8.2f} GB    (active weights streamed per token)")
+    if fits_gb is not None:
+        status = "FITS" if total_vram_gb <= fits_gb * 0.9 else "OVERFLOWS device VRAM"
+        print(f"  device                 {fits_gb:>8.0f} GB    {status}")
+    print()
+    if cfg.is_moe:
+        print("  Note: MoE decode throughput scales with `active_params`, not total.")
+        print("  With a good expert-parallel kernel (vLLM EP, SGLang), decode on")
+        print("  Mixtral-8x7B is closer to a 13B model's tok/s than to 47B.")
+        print()
     return 0
 
 

@@ -240,6 +240,71 @@ CATALOG: list[CatalogEntry] = [
         ollama_tags=("aya:8b", "aya-expanse:8b"),
         released="2024-10",
     ),
+    # ------- MoE models ---------------------------------------------------
+    CatalogEntry(
+        slug="mixtral-8x7b",
+        config=ModelConfig(
+            name="mistralai/Mixtral-8x7B-Instruct-v0.1",
+            num_layers=32, hidden_size=4096,
+            num_attention_heads=32, num_key_value_heads=8, head_dim=128,
+            vocab_size=32000, max_position_embeddings=32768,
+            attention_type="GQA", ffn_type="swiglu", ffn_intermediate_size=14336,
+            is_moe=True, num_experts=8, num_experts_per_token=2,
+        ),
+        provider="Mistral AI", quality_0_100=80, license="Apache-2.0",
+        use_cases=("general", "chat", "coding"),
+        ollama_tags=("mixtral:8x7b",),
+        released="2023-12",
+    ),
+    CatalogEntry(
+        slug="qwen3-30b-a3b",
+        config=ModelConfig(
+            name="Qwen/Qwen3-30B-A3B",
+            num_layers=48, hidden_size=2048,
+            num_attention_heads=32, num_key_value_heads=4, head_dim=64,
+            vocab_size=151936, max_position_embeddings=32768,
+            attention_type="GQA", ffn_type="swiglu", ffn_intermediate_size=768,
+            is_moe=True, num_experts=128, num_experts_per_token=8,
+        ),
+        provider="Alibaba", quality_0_100=85, license="Apache-2.0",
+        use_cases=("general", "reasoning", "coding", "agent"),
+        released="2025-04",
+    ),
+    CatalogEntry(
+        # Qwen3-235B-A22B uses non-standard attention geometry
+        # (q_proj_dim = 64 × 128 = 8192, not hidden_size = 4096). Our current
+        # ModelConfig invariant requires num_heads × head_dim == hidden_size,
+        # so we compress head_dim to 64 here — that misses ~5% of the
+        # attention-projection cost but keeps the model usable. Relaxing the
+        # invariant cleanly is on the 0.4.0 roadmap.
+        slug="qwen3-235b-a22b",
+        config=ModelConfig(
+            name="Qwen/Qwen3-235B-A22B",
+            num_layers=94, hidden_size=4096,
+            num_attention_heads=64, num_key_value_heads=4, head_dim=64,
+            vocab_size=151936, max_position_embeddings=32768,
+            attention_type="GQA", ffn_type="swiglu", ffn_intermediate_size=1536,
+            is_moe=True, num_experts=128, num_experts_per_token=8,
+        ),
+        provider="Alibaba", quality_0_100=93, license="Apache-2.0",
+        use_cases=("general", "reasoning", "coding", "agent"),
+        released="2025-04",
+    ),
+    CatalogEntry(
+        slug="deepseek-v2-lite",
+        config=ModelConfig(
+            name="deepseek-ai/DeepSeek-V2-Lite",
+            num_layers=27, hidden_size=2048,
+            num_attention_heads=16, num_key_value_heads=16, head_dim=128,
+            vocab_size=102400, max_position_embeddings=32768,
+            attention_type="MHA", ffn_type="swiglu", ffn_intermediate_size=1408,
+            is_moe=True, num_experts=64, num_experts_per_token=6,
+        ),
+        provider="DeepSeek", quality_0_100=76, license="MIT",
+        use_cases=("general", "coding"),
+        released="2024-05",
+    ),
+
     CatalogEntry(
         slug="aya-expanse-35b",
         config=_cfg("CohereForAI/aya-expanse-32b",
