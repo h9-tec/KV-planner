@@ -8,6 +8,14 @@ principles, with a formula and a citation for every number.
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![tests 134](https://img.shields.io/badge/tests-134%20passing-brightgreen.svg)](#development)
 [![version 0.3.0](https://img.shields.io/badge/version-0.3.0-fa9450.svg)](CHANGELOG.md)
+[![status: Research Preview](https://img.shields.io/badge/status-Research%20Preview-eb6e88.svg)](#honest-limitations)
+
+> **Status: Research Preview.** The physics engine is sound and tests well
+> against published literature. End-to-end predictions have so far been
+> validated on a single laptop GPU (RTX 5060 Laptop) running Ollama —
+> enterprise GPU validation (H100, A100, MI300X) is on the roadmap but not
+> done yet. See [Honest limitations](#honest-limitations) below before
+> sizing a production cluster based solely on kv-planner's output.
 
 ![kv-planner native GUI](docs/screenshots/gui-01-overview.png)
 
@@ -17,6 +25,8 @@ principles, with a formula and a citation for every number.
 
 - [What it is](#what-it-is)
 - [How it's different](#how-its-different)
+- [Why not an Excel sheet?](#why-not-an-excel-sheet)
+- [Honest limitations](#honest-limitations)
 - [Install](#install)
 - [Quick start](#quick-start-five-minutes)
 - [Feature tour](#feature-tour)
@@ -94,6 +104,118 @@ Positioning in one sentence:
 **llmfit decides *what runs on your box*; kv-planner explains *why, how
 fast, how much, with which quantization, on which provider, and whether
 your cluster meets the SLO*.**
+
+## Why not an Excel sheet?
+
+Karpathy's
+[llm-numbers](https://github.com/ray-project/llm-numbers), EleutherAI's
+[Transformer Math 101](https://blog.eleuther.ai/transformer-math/), and
+kipply's [Transformer Inference Arithmetic](https://kipp.ly/transformer-inference-arithmetic)
+are excellent mental-arithmetic references. vLLM ships an internal memory
+estimator. HuggingFace Accelerate has `estimate-memory`. Why a separate
+tool?
+
+**The incremental value of kv-planner over a spreadsheet.** Back-of-envelope
+math gets the order of magnitude right but misses the details that drive
+real deployment decisions:
+
+| Question | Spreadsheet answer | kv-planner answer |
+|---|---|---|
+| Weight bytes? | `params × 2` (fp16) | Same, but precision-aware + TP-sharded |
+| KV cache? | `s × 2 × L × H × D × 2` | Same, **plus** GQA-aware (K/V shrink with `num_kv_heads`) |
+| Decode throughput? | `min(peak_TFLOPS, bw) / model_bytes` | Same, **plus** per-token KV reads grow with context; roofline ridge identifies compute-bound vs memory-bound regime |
+| Which batch / precision? | Try a few, guess | Sweep all, rank physically |
+| Which GPU for my RPS + SLO? | Compare two datasheets | Search `GPU × TP × precision × replicas` exhaustively |
+| How long will the fine-tune take? | (nothing) | 16 B/param ZeRO math + activation checkpointing + QLoRA NF4 breakdown |
+| Why is it OOM-ing? | (nothing) | Memory waterfall with formula + citation for every term |
+| Actual runtime performance? | (nothing) | Concurrent load tester + self-calibrates MBU per `(model, gpu, runtime)` |
+
+Back-of-envelope vs kv-planner vs measured, same workload
+(Llama-3 8B fp16, H100 SXM5, batch 32, 2048+512 context):
+
+| Metric | Naive spreadsheet | kv-planner | Published vLLM numbers |
+|---|---:|---:|---:|
+| Memory, fp16 | 16 GB (weights only) | 30.9 GB (weights + KV + activations + workspace) | ~31 GB |
+| Decode tok/s | `3350 / 16 ≈ 209` (single-seq) | 29 k tok/s (batch 32, mbu 0.75) | [published vLLM bench: 25–30 k](https://docs.vllm.ai/en/latest/performance/benchmarks.html) |
+| Ridge (FLOPs/byte) | (not computed) | 295 | 295 |
+
+The **two** rows a spreadsheet gets wrong — memory (misses 47 % of it) and
+throughput (wrong by context/batch/MBU) — are the two rows that determine
+whether your deployment works.
+
+## Honest limitations
+
+Before you plan a $50 k/month cluster on kv-planner's output, know what's
+actually validated and what isn't:
+
+### What's solid
+
+- **Physics formulas.** Every FLOPs/token, KV-cache-bytes, roofline
+  ridge, and ring-AllReduce equation matches published references
+  (kipply, Williams 2009, PaLM, vLLM paper, Megatron-LM, Chinchilla).
+  134 regression tests anchor the numbers. If a formula regresses, a
+  test fails.
+- **Memory waterfall.** The `why` command's breakdown is auditable —
+  every term has a formula and a citation URL. If you disagree with a
+  number, you can see exactly which line to challenge.
+- **GPU database.** All 37 entries use **dense FP16 tensor-core
+  TFLOPS** traceable to a vendor whitepaper. No sparse-mode numbers
+  sneaking in; no FP32-CUDA-reported-as-tensor-core.
+
+### What's unvalidated
+
+- **Single-GPU validation sample.** Real end-to-end measurements so
+  far cover exactly **one GPU** (RTX 5060 Laptop, 8 GB, Ollama
+  runtime). Llama-3 8B / DeepSeek-R1-Distill-7B / Aya-8B measured on
+  that one box. H100 / A100 / MI300X — the GPUs that matter for
+  production capacity planning — have **no real-measurement**
+  validation from us yet. Predictions for those GPUs are purely
+  theoretical roofline output.
+- **Prefix-cache hit rate is an INPUT, not a prediction.** The
+  `PrefixCachingAnalyzer` takes `hit_rate` as a parameter (the user
+  provides it from their own workload trace). The included
+  `estimate_hit_rate` function is a simple LRU upper-bound — useful
+  for what-if analysis, not a substitute for measuring a real workload.
+- **Quantization quality numbers are literature averages, not your
+  model.** The PPL deltas in the quantization table below come from
+  published benchmarks on specific models. Your model / language /
+  task may see larger or smaller degradation. Always run the actual
+  quantized model before shipping.
+- **Cost numbers are point-in-time.** Spot prices swing 30–50 %
+  weekly. Run `kv-planner pricing --refresh` to pull OpenRouter's
+  live data. GPU cloud providers add/remove SKUs constantly.
+
+### What's known-imperfect
+
+- **Architecture over-engineering.** Five DDD layers
+  (`domain` / `core` / `application` / `infrastructure` / `cli`) for
+  what is fundamentally a calculator is heavier than needed. Planned
+  0.4.0 consolidation: merge `domain` + `core` + `application` into
+  one layer; preserve the `infrastructure` / `core` split so data
+  sources stay swappable. Until then, adding a GPU stays a one-file
+  change (`gpu_specs.py`) but new contributors face layer-navigation
+  overhead.
+- **Reasoning-model profiles are hard-coded.** Four thinking-token
+  distributions ship (`deepseek-r1-math`, `o3-mini-chat`, `qwq-code`,
+  `balanced`). Your workload's p99 will differ — use the numbers as
+  starting points, not ground truth.
+- **No speculative-decoding measurement loop yet.** `specdec` gives a
+  closed-form speedup estimate; it doesn't measure acceptance rate on
+  your actual workload.
+
+### Roadmap to un-research-preview
+
+- **0.3.1 — More validation.** Add published vLLM / SGLang / llm-d
+  benchmark points as regression fixtures for H100 TP1/TP8 and A100;
+  report delta between predicted and published per-(model, GPU) pair.
+- **0.4.0 — Architecture consolidation.** Merge the three upper
+  layers; aim for ~30 % LOC reduction, same public API.
+- **0.4.0 — Workload trace analyzer.** Parse real request logs
+  (OpenAI JSONL, vLLM metrics) to compute empirical prefix-cache hit
+  rates; drop the "upper bound estimate" caveat.
+- **0.5.0 — Enterprise validation partners.** Run end-to-end
+  measurement on H100 / A100 / MI300X via cloud GPU rentals; publish
+  predicted-vs-measured tables.
 
 ## Install
 
@@ -252,13 +374,22 @@ eats right up.
 
 ![Quantization comparison](docs/screenshots/gui-07-precision.png)
 
-Default speedup factors (override via `--precision`):
+Default speedup factors **and perplexity deltas** — the latter come from
+published benchmarks on Llama-2 / Llama-3 at model sizes 7B–70B.
+**Numbers on your specific model may differ** — always measure before
+shipping:
 
-| Precision | Speedup vs FP16 | Source |
-|---|---|---|
-| FP8 | 1.4× | [Baseten / NVIDIA H100 TE](https://www.baseten.co/blog/33-faster-llm-inference-with-fp8-quantization/) |
-| INT8 W8A8 | 1.6× | [vLLM + SmoothQuant (Red Hat)](https://developers.redhat.com/articles/2024/08/14/llm-compressor-here-faster-inference-vllm) |
-| INT4 + Marlin | 2.6× | [Frantar & Alistarh 2024](https://arxiv.org/abs/2408.11743) |
+| Precision | Speedup vs FP16 | PPL delta vs FP16 | MMLU drop | Source |
+|---|---|---|---|---|
+| FP8 (H100+ Transformer Engine) | 1.4× | +0.3 PPL | ≤ 0.5 pts | [Baseten / NVIDIA H100 TE](https://www.baseten.co/blog/33-faster-llm-inference-with-fp8-quantization/); [NVIDIA H100 vs A100 TRT-LLM blog](https://nvidia.github.io/TensorRT-LLM/blogs/H100vsA100.html) |
+| INT8 W8A8 (SmoothQuant) | 1.6× | +1.0 PPL | 1–3 pts | [SmoothQuant paper (ICML 2023, arXiv 2211.10438)](https://arxiv.org/abs/2211.10438); [Red Hat LLM-Compressor](https://developers.redhat.com/articles/2024/08/14/llm-compressor-here-faster-inference-vllm) |
+| INT4 AWQ / GPTQ + Marlin | 2.6× | +2.5 PPL | < 1 pt (on strong 7B+) | [AWQ (arXiv 2306.00978)](https://arxiv.org/abs/2306.00978); [Marlin kernel (arXiv 2408.11743)](https://arxiv.org/abs/2408.11743); [Jarvis Labs benchmarks](https://jarvislabs.ai/blog/vllm-quantization-complete-guide-benchmarks) |
+| KV-cache INT4 | (extra ~1.3× decode) | +3–8 PPL | 3–6 pts | [KVQuant (arXiv 2401.18079)](https://arxiv.org/abs/2401.18079) — **noticeable accuracy drop, production use cautiously** |
+
+The `QuantizationEvaluator.PERPLEXITY_DELTAS` constants in
+[`core/strategies/quantization.py`](src/kv_planner/core/strategies/quantization.py)
+expose these as raw values — override them if your model family is
+known to deviate.
 
 ### 6. GPU comparison — throughput + cost
 
