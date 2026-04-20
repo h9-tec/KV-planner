@@ -15,15 +15,15 @@ look like. It is deliberately short right now.
 
 | Category | Count | Comment |
 |---|---|---|
-| GPUs with real end-to-end measurement | **1** (RTX 5060 Laptop) | via Ollama local runtime |
+| GPUs with real end-to-end measurement | **2** (RTX 5060 Laptop, RTX 4090) | Ollama local + vLLM on RunPod |
 | GPUs with published-benchmark comparison | 0 (planned) | vLLM / SGLang / llm-d numbers pending |
-| GPUs with only theoretical roofline | 36 | everything in `gpu_specs.py` except RTX 5060 Laptop |
-| Dense models measured | 3 (Llama-3.2-3B, DeepSeek-R1-Distill-7B, Aya-8B) | |
+| GPUs with only theoretical roofline | 35 | everything in `gpu_specs.py` except the two measured |
+| Dense models measured | 4 (Llama-3.2-3B, DeepSeek-R1-Distill-7B, Aya-8B, Qwen2.5-7B) | |
 | MoE models measured | 0 | Mixtral, Qwen3-MoE, DeepSeek-V2 — theory only |
-| Total predictive samples | ~3 | |
+| Total predictive samples | ~4 | |
 
-**One GPU is not a validation set.** The rest of this file enumerates
-what we do have, what's next, and how to reproduce each number.
+**Two GPUs is still not a full validation set.** The rest of this file
+enumerates what we do have, what's next, and how to reproduce each number.
 
 ---
 
@@ -71,6 +71,65 @@ saturation knee is at concurrency 1:
 The sweep correctly identifies that Ollama-on-laptop is single-request
 bound. Predictions for laptop + Ollama should assume concurrency 1, not
 aggregate capacity.
+
+### Enterprise validation — RTX-4090 + vLLM on RunPod
+
+First run of the `scripts/validation/runpod_orchestrator.py` harness.
+One config so far; the other four in the default matrix (H100 × 2,
+A100, L40S) are next.
+
+| Config | Value |
+|---|---|
+| GPU | NVIDIA GeForce RTX 4090 (24 GB) |
+| Runtime | vLLM 0.19.1 |
+| Model | Qwen2.5-7B-Instruct, fp16 |
+| Workload | input=2048, output=256, concurrency=8, requests=32 |
+| Wall cost | ~$0.13 for a ~6 min pod |
+
+Predicted (kv-planner, default MBU=0.75):
+
+| Metric | Value |
+|---|---:|
+| aggregate tok/s | 416 |
+| TPOT | 20.3 ms |
+| prefill | 344 ms |
+| arithmetic intensity | 1858 FLOPs/byte |
+| prefill compute-bound? | yes |
+
+Measured (vLLM on RunPod RTX-4090, 32 concurrent requests):
+
+| Metric | p50 | p99 |
+|---|---:|---:|
+| aggregate tok/s | 482 | — |
+| TPOT | 15.9 ms | 15.92 ms |
+| TTFT | 60.4 ms | 588.3 ms |
+| E2E | 4113 ms | 4649 ms |
+| errors | 0 | — |
+
+Accuracy:
+
+| Metric | MAPE | Direction |
+|---|---:|---|
+| TPOT | **27.7 %** | predicted slower than reality — MBU=0.75 was conservative for vLLM on 4090 |
+| aggregate throughput | **13.8 %** | predicted lower than reality — same cause |
+
+**Interpretation.** vLLM's paged-attention + Flash-Attention kernels on
+RTX-4090 achieve an effective MBU of roughly 0.59 (back-solve:
+`0.75 × 20.3 / 15.9 ≈ 0.59`). The default MBU=0.75 in kv-planner was
+tuned for H100-class SXM nodes; consumer Ada is a bit behind. This is
+the exact workflow the `calibrate` command exists for — run it once
+per (runtime, GPU) pair and pass the derived MBU back via
+`--memory-efficiency`.
+
+Reproduce (requires a RunPod API key + HF token):
+
+```bash
+export RUNPOD_API_KEY=... HF_TOKEN=...
+python scripts/validation/runpod_orchestrator.py --smoke --budget-usd 3
+python scripts/validation/aggregate_results.py
+```
+
+Full artifact: [`docs/validation_results/RTX-4090_qwen2.5-7b.json`](docs/validation_results/RTX-4090_qwen2.5-7b.json).
 
 ### Calibration-loop validation
 
@@ -134,7 +193,10 @@ implementations do not).
 
 ## 4. How this page grows
 
-### Pending: RunPod validation campaign (harness ready, awaiting run)
+### In progress: RunPod validation campaign
+
+First configuration landed (RTX-4090 × Qwen2.5-7B, see Section 1
+above). The remaining default matrix is pending.
 
 The [`scripts/validation/`](scripts/validation/) harness can run
 kv-planner predictions against live vLLM servers on rented GPUs and
@@ -172,8 +234,10 @@ back-solves MBU with `kv-planner calibrate`, and emits one JSON
 containing: config, predicted numbers, measured numbers,
 calibration-derived MBU, and MAPE (TPOT + throughput).
 
-**As of this commit the campaign has not been run.** When it does, this
-section gets replaced by the measured table.
+**As of this commit, 1 of 5 default configs has been measured** (see
+Section 1 above). The remaining four (H100 × Llama-3-8B, H100 ×
+Qwen2.5-7B, A100 × Llama-3-8B, L40S × Llama-3-8B) will be appended
+here as they land.
 
 ### Roadmap beyond this campaign
 

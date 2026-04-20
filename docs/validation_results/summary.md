@@ -1,0 +1,75 @@
+# kv-planner — RunPod validation campaign results
+
+Generated: 2026-04-20T19:52:13Z
+Configs measured: **1**
+
+## Summary table
+
+| GPU | Model | Precision | Predicted tok/s | Measured tok/s | Predicted TPOT ms | Measured TPOT ms | MAPE TPOT | MBU derived |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| RTX-4090 | qwen2.5-7b | fp16 | 416 | 482 | 20.3 | 15.9 | 27.7% | None |
+
+## Per-config detail
+
+### RTX-4090 — qwen2.5-7b (fp16)
+
+```json
+{
+  "config": {
+    "gpu_key": "RTX-4090",
+    "model_hf": "Qwen/Qwen2.5-7B-Instruct",
+    "model_slug": "qwen2.5-7b",
+    "precision": "fp16",
+    "input_length": 2048,
+    "output_length": 256,
+    "concurrency": 8,
+    "num_requests": 32,
+    "runtime": "vllm"
+  },
+  "predicted": {
+    "throughput_tok_s": 415.61023625354596,
+    "prefill_ms": 343.96136395932206,
+    "decode_total_ms": 5199.69420325926,
+    "tpot_ms": 20.311305481481483,
+    "mfu": 0.5,
+    "mbu": 0.75,
+    "ai": 1858.2429188670187,
+    "compute_bound_prefill": true
+  },
+  "measured": {
+    "aggregate_tok_s": 482.2,
+    "ttft_ms_p50": 60.4,
+    "ttft_ms_p99": 588.3,
+    "tpot_ms_p50": 15.9,
+    "tpot_ms_p99": 15.92,
+    "e2e_ms_p50": 4113.2,
+    "e2e_ms_p99": 4648.9,
+    "errors": 0,
+    "raw_keys": [
+      "aggregate_tok_s",
+      "api",
+      "concurrency",
+      "e2e_ms",
+      "endpoint",
+      "errors",
+      "goodput_pct",
+      "model",
+      "num_requests",
+      "per_request_tok_s_mean",
+      "total_output_tokens",
+      "tpot_ms",
+      "ttft_ms",
+      "wall_s"
+    ]
+  },
+  "calibration": {
+    "derived_mbu": null,
+    "achieved_bandwidth_gb_s": null,
+    "peak_bandwidth_gb_s": null
+  },
+  "accuracy": {
+    "mape_tpot_pct": 27.7,
+    "mape_throughput_pct": 13.8
+  }
+}
+```
