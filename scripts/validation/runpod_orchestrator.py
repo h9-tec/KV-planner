@@ -144,11 +144,19 @@ def list_available_gpus(api_key: str) -> list[dict]:
     return _gql(query, {}, api_key).get("gpuTypes", [])
 
 
+def get_my_pubkey(api_key: str) -> str:
+    """Fetch the user's registered SSH public key — needed so the pod's
+    /start.sh actually launches sshd."""
+    data = _gql("{ myself { pubKey } }", {}, api_key)
+    return ((data.get("myself") or {}).get("pubKey") or "").strip()
+
+
 def create_pod(
     api_key: str,
     gpu_type: str,
     image: str = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
     cloud_type: str = "ALL",
+    pubkey: str | None = None,
 ) -> str:
     """Create a pod; try COMMUNITY first, then SECURE if supply-constrained.
 
@@ -167,21 +175,25 @@ def create_pod(
     cloud_types_to_try = (
         ["COMMUNITY", "SECURE"] if cloud_type == "ALL" else [cloud_type]
     )
+    env_vars = []
+    if pubkey:
+        # runpod/pytorch images launch sshd automatically when PUBLIC_KEY is set.
+        env_vars.append({"key": "PUBLIC_KEY", "value": pubkey})
     last_err: Exception | None = None
     for ct in cloud_types_to_try:
         variables = {"input": {
             "cloudType": ct,
             "gpuCount": 1,
-            "volumeInGb": 60,
-            "containerDiskInGb": 30,
-            "minVcpuCount": 4,
-            "minMemoryInGb": 30,
+            "volumeInGb": 30,
+            "containerDiskInGb": 20,
+            "minVcpuCount": 2,
+            "minMemoryInGb": 16,
             "gpuTypeId": gpu_type,
             "name": f"kvp-val-{int(time.time())}",
             "imageName": image,
-            "dockerArgs": "",
             "ports": "22/tcp,8000/http",
             "volumeMountPath": "/workspace",
+            "env": env_vars,
         }}
         try:
             pod = _gql(query, variables, api_key)["podFindAndDeployOnDemand"]
@@ -254,7 +266,11 @@ def run_one(
     t0 = time.time()
     pod_id: Optional[str] = None
     try:
-        pod_id = create_pod(api_key, cfg.gpu_runpod_id)
+        pubkey = get_my_pubkey(api_key)
+        if not pubkey:
+            return RunResult(cfg, "failed",
+                error="no SSH key registered — add ~/.ssh/id_ed25519.pub at runpod.io/console/user/settings")
+        pod_id = create_pod(api_key, cfg.gpu_runpod_id, pubkey=pubkey)
         print(f"  pod_id={pod_id}, waiting for RUNNING + SSH port…")
         # Wait up to 15 min for RUNNING + port (heavy images pull slowly)
         pod = None
@@ -284,7 +300,27 @@ def run_one(
             terminate_pod(api_key, pod_id)
             return RunResult(cfg, "failed", error="no public SSH port")
 
-        print(f"  pod running: {ssh_host}:{ssh_port}")
+        print(f"  pod running: {ssh_host}:{ssh_port} — waiting for sshd")
+
+        # sshd inside the container usually needs another 30–90 s after
+        # the pod reaches RUNNING to accept connections.
+        import subprocess
+        ssh_ready = False
+        for i in range(12):   # up to 2 minutes
+            probe = subprocess.run(
+                f"ssh -p {ssh_port} {ssh_opts} "
+                f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+                f"-o ConnectTimeout=5 -o BatchMode=yes "
+                f"root@{ssh_host} 'echo ready'",
+                shell=True, capture_output=True, timeout=15,
+            )
+            if probe.returncode == 0 and b"ready" in probe.stdout:
+                ssh_ready = True
+                print(f"  sshd ready after {(i+1)*10}s")
+                break
+            time.sleep(10)
+        if not ssh_ready:
+            return RunResult(cfg, "failed", error="sshd never answered on assigned port")
 
         # SSH + execute harness
         remote_cmd = (
@@ -295,7 +331,6 @@ def run_one(
             f"bash scripts/validation/in_pod_validate.sh "
             f"'{cfg.model_hf}' '{cfg.gpu_db_key}' '{cfg.model_slug}' '{cfg.precision}'"
         )
-        import subprocess
         cmd = (
             f"ssh -p {ssh_port} {ssh_opts} "
             f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
