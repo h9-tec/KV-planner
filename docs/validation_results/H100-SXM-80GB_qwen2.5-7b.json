@@ -1,6 +1,6 @@
 {
   "config": {
-    "gpu_key": "RTX-4090",
+    "gpu_key": "H100-SXM-80GB",
     "model_hf": "Qwen/Qwen2.5-7B-Instruct",
     "model_slug": "qwen2.5-7b",
     "precision": "fp16",
@@ -11,23 +11,23 @@
     "runtime": "vllm"
   },
   "predicted": {
-    "throughput_tok_s": 415.61023625354596,
-    "prefill_ms": 343.96136395932206,
-    "decode_total_ms": 5199.69420325926,
-    "tpot_ms": 20.311305481481483,
+    "throughput_tok_s": 1420.4518136524061,
+    "prefill_ms": 57.4544159009909,
+    "decode_total_ms": 1564.5647035478607,
+    "tpot_ms": 6.111580873233831,
     "mfu": 0.5,
     "mbu": 0.75,
     "ai": 1858.2429188670187,
     "compute_bound_prefill": true
   },
   "measured": {
-    "aggregate_tok_s": 474.2,
-    "ttft_ms_p50": 365.5,
-    "ttft_ms_p99": 603.8,
-    "tpot_ms_p50": 15.85,
-    "tpot_ms_p99": 15.87,
-    "e2e_ms_p50": 4409.2,
-    "e2e_ms_p99": 4644.8,
+    "aggregate_tok_s": 1093.3,
+    "ttft_ms_p50": 51.6,
+    "ttft_ms_p99": 796.5,
+    "tpot_ms_p50": 6.0,
+    "tpot_ms_p99": 7.67,
+    "e2e_ms_p50": 1967.9,
+    "e2e_ms_p99": 2329.8,
     "errors": 0,
     "raw_keys": [
       "aggregate_tok_s",
@@ -52,7 +52,7 @@
     "peak_bandwidth_gb_s": null
   },
   "accuracy": {
-    "mape_tpot_pct": 28.1,
-    "mape_throughput_pct": 12.4
+    "mape_tpot_pct": 1.9,
+    "mape_throughput_pct": 29.9
   }
 }
