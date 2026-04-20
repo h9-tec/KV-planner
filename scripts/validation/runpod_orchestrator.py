@@ -183,14 +183,14 @@ def create_pod(
     for ct in cloud_types_to_try:
         # Disk sizing: 7B-8B fp16 models are ~15-16 GB; plus HF download buffer
         # (safetensors → model cache ≈ 2×), plus pip cache, plus vllm CUDA
-        # kernels. 60 GB volume comfortably fits one model; 30 GB container
-        # disk holds /usr + pip installs. Smaller == "No space left on device"
-        # during HF download (confirmed failure mode on a 30 GB volume).
+        # kernels. 45 GB volume fits one 7B model + buffer; 25 GB container
+        # disk holds /usr + pip installs. (60/30 triggered INTERNAL_SERVER_ERROR
+        # on this provider, 30/20 triggered ENOSPC during HF download.)
         variables = {"input": {
             "cloudType": ct,
             "gpuCount": 1,
-            "volumeInGb": 60,
-            "containerDiskInGb": 30,
+            "volumeInGb": 45,
+            "containerDiskInGb": 25,
             "minVcpuCount": 2,
             "minMemoryInGb": 16,
             "gpuTypeId": gpu_type,
