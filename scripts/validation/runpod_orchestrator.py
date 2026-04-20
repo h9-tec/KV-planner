@@ -59,28 +59,26 @@ class Config:
         return self.estimated_pod_minutes / 60.0 * self.estimated_hourly_usd
 
 
-# Minimal matrix — dense on enterprise + prosumer. MoE validation needs
-# larger VRAM so it's a separate expanded run.
+# Minimal matrix — dense on enterprise + prosumer. Qwen2.5-7B everywhere
+# so HF Meta-gate access isn't a hidden variable; add Llama-3 rows once
+# the HF token is confirmed to have access.
 DEFAULT_MATRIX: list[Config] = [
     # H100 SXM 80GB — the production reference
-    Config("NVIDIA H100 80GB HBM3", "H100-SXM-80GB",
-           "meta-llama/Meta-Llama-3-8B-Instruct", "llama-3-8b",
-           precision="fp16", estimated_hourly_usd=3.99),
     Config("NVIDIA H100 80GB HBM3", "H100-SXM-80GB",
            "Qwen/Qwen2.5-7B-Instruct", "qwen2.5-7b",
            precision="fp16", estimated_hourly_usd=3.99),
 
     # A100 80GB — second most common production GPU
     Config("NVIDIA A100 80GB PCIe", "A100-PCIe-80GB",
-           "meta-llama/Meta-Llama-3-8B-Instruct", "llama-3-8b",
+           "Qwen/Qwen2.5-7B-Instruct", "qwen2.5-7b",
            precision="fp16", estimated_hourly_usd=1.89),
 
     # L40S — cost-optimised serving tier
     Config("NVIDIA L40S", "L40S",
-           "meta-llama/Meta-Llama-3-8B-Instruct", "llama-3-8b",
+           "Qwen/Qwen2.5-7B-Instruct", "qwen2.5-7b",
            precision="fp16", estimated_hourly_usd=1.19),
 
-    # RTX 4090 — prosumer validation (use Qwen2.5-7B: non-gated, fits 24GB)
+    # RTX 4090 — prosumer validation (already landed in smoke)
     Config("NVIDIA GeForce RTX 4090", "RTX-4090",
            "Qwen/Qwen2.5-7B-Instruct", "qwen2.5-7b",
            precision="fp16", estimated_hourly_usd=0.44),
