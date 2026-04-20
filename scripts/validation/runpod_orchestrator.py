@@ -107,9 +107,16 @@ RUNPOD_ENDPOINT = "https://api.runpod.io/graphql"
 def _gql(query: str, variables: dict, api_key: str) -> dict:
     body = json.dumps({"query": query, "variables": variables}).encode()
     req = urllib.request.Request(
-        f"{RUNPOD_ENDPOINT}?api_key={api_key}",
+        RUNPOD_ENDPOINT,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            # RunPod's Cloudflare WAF blocks the default Python UA. Use a
+            # generic curl-like UA to get past the integrity check.
+            "User-Agent": "kv-planner-validator/0.3 (+https://github.com/h9-tec/KV-planner)",
+        },
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
