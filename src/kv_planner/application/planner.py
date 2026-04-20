@@ -7,7 +7,7 @@ deployment plans with memory, performance, cost, and strategy recommendations.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from kv_planner.core.memory import PagedMemoryCalculator
 from kv_planner.core.performance import RooflineAnalyzer, PerformanceMetrics
@@ -18,15 +18,13 @@ from kv_planner.core.strategies import (
     PrefixCachingMetrics,
 )
 from kv_planner.core.cost import CostAnalyzer, CostMetrics
-from kv_planner.domain import ModelConfig, HardwareSpec
+from kv_planner.domain import HardwareSpec, ModelConfig, PrecisionType
 from kv_planner.infrastructure.hardware_db import GPUDatabase
 from kv_planner.infrastructure.hardware_db.laptop_adjustments import (
-    is_laptop_gpu,
     adjust_performance_metrics,
-    get_laptop_info,
+    is_laptop_gpu,
 )
 
-PrecisionType = Literal["fp32", "fp16", "bf16", "fp8", "int8", "int4"]
 OptimizationGoal = Literal["cost", "latency", "throughput", "quality", "balanced"]
 
 
@@ -63,7 +61,7 @@ class DeploymentPlan:
         memory_utilization_pct: float
 
         # Configuration
-        vllm_config: dict[str, any]
+        vllm_config: dict[str, Any]
 
         # Summary
         summary: str
@@ -96,7 +94,7 @@ class DeploymentPlan:
     memory_utilization_pct: float
 
     # Configuration
-    vllm_config: dict = field(default_factory=dict)
+    vllm_config: dict[str, Any] = field(default_factory=dict)
 
     # Summary
     summary: str = ""
@@ -258,7 +256,7 @@ class DeploymentPlanner:
                 gpu_model=hardware.gpu_model,
                 throughput_tokens_per_sec=performance.throughput_tokens_per_sec,
                 latency_ms=performance.total_latency_ms,
-                profile="balanced",  # Use balanced profile by default
+                profile="gaming",  # default for laptop SKUs
             )
 
             # Reconstruct PerformanceMetrics with adjusted values

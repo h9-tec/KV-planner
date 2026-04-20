@@ -44,14 +44,44 @@ class TestRooflineAnalyzer:
     def test_calculate_flops_per_token(
         self, analyzer: RooflineAnalyzer, llama3_8b: ModelConfig
     ) -> None:
-        """Test FLOPs per token calculation."""
-        flops = analyzer.calculate_flops_per_token(llama3_8b)
-
-        # Formula: F = n_layers × 24 × d_model²
-        expected = llama3_8b.num_layers * 24 * (llama3_8b.hidden_size ** 2)
-
+        """FLOPs/token should include attention (scales with seq_len), GQA-aware
+        Q/K/V projections, and the real d_ff — NOT the old 24·d² shortcut."""
+        # Per layer, per token, at seq_len=2048, Llama-3 8B
+        # d=4096, d_kv=1024, d_ff=14336
+        # q+o = 2·(2·d·d)                = 2·33_554_432 = 67_108_864
+        # kv  = 2·(2·d·d_kv)             = 2·8_388_608  = 16_777_216
+        # qk  = 2·d·s                    = 16_777_216
+        # av  = 2·d·s                    = 16_777_216
+        # ffn = 3·2·d·d_ff (SwiGLU)      = 352_321_536
+        # ----------------------------------------------------------------
+        # total per layer = 469_762_048
+        # × 32 layers     = 15_032_385_536
+        expected = 32 * (
+            2 * (2 * 4096 * 4096)
+            + 2 * (2 * 4096 * 1024)
+            + 2 * 4096 * 2048
+            + 2 * 4096 * 2048
+            + 3 * 2 * 4096 * 14336
+        )
+        flops = analyzer.calculate_flops_per_token(llama3_8b, sequence_length=2048)
         assert flops == expected
-        assert flops > 0
+
+    def test_flops_scales_with_sequence_length(
+        self, analyzer: RooflineAnalyzer, llama3_8b: ModelConfig
+    ) -> None:
+        """The attention term makes long-context decode cost more per token."""
+        f_short = analyzer.calculate_flops_per_token(llama3_8b, sequence_length=128)
+        f_long = analyzer.calculate_flops_per_token(llama3_8b, sequence_length=32768)
+        assert f_long > f_short
+
+    def test_llama3_8b_parameter_count(self, llama3_8b: ModelConfig) -> None:
+        """Regression: Llama-3 8B should report ~8.03B params, not pre-fix 6.97B."""
+        params = llama3_8b.total_params()
+        assert 7.9e9 < params < 8.2e9, f"Expected ~8B, got {params/1e9:.2f}B"
+
+    def test_kv_cache_bytes_per_token_llama3(self, llama3_8b: ModelConfig) -> None:
+        """Sanity: Llama-3 8B fp16 KV cache = 131,072 bytes/token (128 KiB)."""
+        assert llama3_8b.kv_cache_bytes_per_token("fp16") == 131072
 
     def test_calculate_arithmetic_intensity(
         self, analyzer: RooflineAnalyzer, llama3_8b: ModelConfig
@@ -84,7 +114,7 @@ class TestRooflineAnalyzer:
 
         # Balance point = TFLOPS / (GB/s)
         # For H100: 989 TFLOPS / 3350 GB/s ≈ 295 FLOPs/byte
-        expected = (h100_single.peak_tflops * 1e12) / (h100_single.hbm_bandwidth_gb_s * 1e9)
+        expected = (h100_single.peak_tflops * 1e12) / (h100_single.memory_bandwidth_gb_s * 1e9)
 
         assert abs(balance_point - expected) < 1.0  # Allow small floating point error
         assert balance_point > 0
@@ -113,22 +143,37 @@ class TestRooflineAnalyzer:
     def test_predict_decode_latency(
         self, analyzer: RooflineAnalyzer, llama3_8b: ModelConfig, h100_single: HardwareSpec
     ) -> None:
-        """Test decode latency prediction."""
+        """Decode latency requires sequence_length (reads the growing KV cache)."""
         latency_ms, achieved_tflops, is_memory_bound = analyzer.predict_decode_latency(
             model=llama3_8b,
             hardware=h100_single,
             batch_size=32,
-            precision="fp16"
+            sequence_length=2048,
+            precision="fp16",
         )
-
-        # Latency should be positive
         assert latency_ms > 0
-
-        # Achieved TFLOPS should be positive but lower than prefill
         assert achieved_tflops > 0
-
-        # Decode is always memory-bound
         assert is_memory_bound
+
+    def test_decode_latency_grows_with_context(
+        self, analyzer: RooflineAnalyzer, llama3_8b: ModelConfig, h100_single: HardwareSpec
+    ) -> None:
+        """**Regression for the #1 bug**: decode must get slower at longer context.
+
+        Pre-fix: predict_decode_latency returned the same latency at any
+        sequence length, because it only counted one token's worth of KV reads.
+        Post-fix: per-step latency scales roughly linearly with context.
+        """
+        short_ms, _, _ = analyzer.predict_decode_latency(
+            llama3_8b, h100_single, batch_size=32, sequence_length=128, precision="fp16"
+        )
+        long_ms, _, _ = analyzer.predict_decode_latency(
+            llama3_8b, h100_single, batch_size=32, sequence_length=32768, precision="fp16"
+        )
+        assert long_ms > short_ms, (
+            "decode at 32k context must be slower than at 128; "
+            "was the KV-cache-reads bug re-introduced?"
+        )
 
     def test_calculate_mfu(
         self, analyzer: RooflineAnalyzer, h100_single: HardwareSpec
@@ -371,12 +416,12 @@ class TestRooflineAnalyzer:
         """Test that tensor parallelism adds communication overhead."""
         # Single GPU
         h100_single_spec = HardwareSpec(
-            gpu_model="H100-80GB",
+            gpu_model="H100-SXM-80GB",
             num_gpus=1,
             gpu_memory_gb=80.0,
             peak_tflops=989.0,
-            hbm_bandwidth_gb_s=3350.0,
-            l2_cache_mb=60.0,
+            memory_bandwidth_gb_s=3350.0,
+            l2_cache_mb=50.0,
             tensor_parallel_size=1,
         )
 

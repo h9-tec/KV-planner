@@ -5,8 +5,9 @@ Complete end-to-end example of kv-planner.
 Demonstrates the full workflow from planning to deployment configuration.
 """
 
+import pathlib
 import sys
-sys.path.insert(0, "/home/hesham-haroun/kv-planner/src")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
 from kv_planner.application import DeploymentPlanner, export
 

@@ -69,7 +69,7 @@ class TestQuantizationEvaluator:
         assert metrics.precision == "fp8"
         assert 40 <= metrics.memory_savings_pct <= 60  # ~50%
         assert metrics.speed_improvement > 1.0  # Faster
-        assert metrics.perplexity_delta == 0.5  # Minimal
+        assert 0.0 < metrics.perplexity_delta < 1.0  # Minimal — literature ~0.3 PPL
         assert metrics.quality_impact == "minimal"
         assert "throughput-critical" in metrics.recommended_for.lower()
 
@@ -90,7 +90,7 @@ class TestQuantizationEvaluator:
         assert metrics.precision == "int4"
         assert 70 <= metrics.memory_savings_pct <= 80  # ~75%
         assert metrics.speed_improvement > 1.0  # Faster
-        assert metrics.perplexity_delta == 5.0  # Moderate
+        assert 1.5 < metrics.perplexity_delta < 5.0  # Moderate — literature ~2.5 PPL
         assert metrics.quality_impact == "moderate"
         assert "memory-constrained" in metrics.recommended_for.lower()
 

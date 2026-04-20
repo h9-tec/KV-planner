@@ -6,12 +6,9 @@ useful for baseline comparisons and fallback scenarios.
 """
 
 import logging
-from typing import Literal
 
-from kv_planner.domain import ModelConfig
+from kv_planner.domain import ModelConfig, PrecisionType
 from kv_planner.domain.exceptions import InsufficientMemoryError
-
-PrecisionType = Literal["fp32", "fp16", "bf16", "fp8", "int8", "int4"]
 
 
 class NaiveMemoryCalculator:

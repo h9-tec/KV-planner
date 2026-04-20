@@ -1,188 +1,136 @@
 """
-Laptop GPU performance adjustment factors.
+Laptop GPU sustained-performance adjustment.
 
-Based on research and validation:
-- Laptop GPUs experience 70-93% performance degradation vs desktop
-- Factors: thermal throttling, power limits, sustained workload
-- Research: RTX 4070 Laptop is 70% slower than RTX 4090 Desktop
-- Validation: RTX 5060 Laptop is 92.8% slower than predicted desktop performance
+**Why this module exists.** A laptop GPU with the same marketing name as a
+desktop card isn't actually the same part: it usually has fewer SMs, lower
+boost clocks, a much lower TGP (power budget), and severe sustained-load
+thermal throttling. For identically-named SKUs ("RTX 5090 Laptop" vs
+"RTX 5090 Desktop"), the measured sustained ratio is typically **50–65 %**
+across reviewers — NOT 7 % as an earlier version of this module claimed.
+
+The 7.2 % figure once enshrined here came from comparing a laptop RTX 5060
+against a desktop RTX 5090 — **that's cross-tier, not a laptop penalty**.
+It has been removed.
+
+**What this module does now.** We do not estimate laptop-vs-desktop ratios
+at all. We apply a pure sustained-thermal factor on top of whatever
+per-SKU TFLOPS the caller already supplied (via
+``gpu_specs.py:RTX-XXXX-Laptop``). Three profiles are exposed:
+
+* ``thin-and-light`` — 0.6 × nominal (aggressive thermal/power limit)
+* ``gaming`` — 0.75 × nominal (typical gaming laptop cooling)
+* ``workstation`` — 0.85 × nominal (high-TDP laptop with good cooling)
 
 Sources:
-- Real-world benchmark validation (RTX 5060 Laptop)
-- Academic research on LLM inference (laptop vs desktop)
-- Thermal throttling studies (30-50% performance loss)
-- Power limit analysis (115W laptop vs 200-575W desktop)
+
+* Tom's Hardware RTX 5090 laptop review — ~50 % slower than desktop counterpart:
+  https://www.tomshardware.com/pc-components/gpus/rtx-5090-laptop-review-claims-gpu-is-a-performance-dud-but-outshines-the-4090-in-power-efficiency
+* Videocardz reviewers roundup — "50 % slower" across reviewers:
+  https://videocardz.com/newz/reviewers-report-geforce-rtx-5090-for-laptops-is-50-slower-than-desktop-version
+* Notebookcheck RTX 5090 Laptop benchmarks:
+  https://www.notebookcheck.net/Nvidia-GeForce-RTX-5090-Laptop-Benchmarks-and-Specs.934947.0.html
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal
+
+LaptopProfile = Literal["thin-and-light", "gaming", "workstation"]
 
 
 @dataclass(frozen=True)
-class LaptopAdjustmentFactors:
-    """
-    Performance adjustment factors for laptop GPUs.
+class LaptopThermalFactor:
+    """Sustained-thermal factor applied on top of the laptop's own spec sheet.
 
-    Attributes:
-        thermal_factor: Performance retained after thermal throttling (0.5-0.7)
-        power_factor: Performance retained due to power limits (0.6-0.8)
-        sustained_factor: Performance retained in sustained workloads (0.7-0.9)
-        overall_factor: Combined performance factor (multiply all above)
+    Interpret as: the fraction of peak FP16 TFLOPS a laptop of this class
+    sustains under a 10-minute LLM-inference workload.
     """
 
-    thermal_factor: float
-    power_factor: float
-    sustained_factor: float
-
-    @property
-    def overall_factor(self) -> float:
-        """Calculate overall performance factor."""
-        return self.thermal_factor * self.power_factor * self.sustained_factor
+    name: str
+    factor: float
+    notes: str
 
 
-# Conservative factors (worst case - thin/light laptops)
-CONSERVATIVE_FACTORS = LaptopAdjustmentFactors(
-    thermal_factor=0.50,  # 50% retained (50% loss to thermal throttling)
-    power_factor=0.60,     # 60% retained (40% loss to power limits)
-    sustained_factor=0.70,  # 70% retained (30% loss in sustained workload)
-)  # Overall: 0.50 * 0.60 * 0.70 = 0.21 (21% of desktop performance)
+THIN_AND_LIGHT = LaptopThermalFactor(
+    name="thin-and-light",
+    factor=0.60,
+    notes="Ultrabooks and thin creator laptops; aggressive TGP limit and short thermal transients.",
+)
 
-# Balanced factors (typical gaming laptops)
-BALANCED_FACTORS = LaptopAdjustmentFactors(
-    thermal_factor=0.60,  # 60% retained (40% loss to thermal throttling)
-    power_factor=0.70,     # 70% retained (30% loss to power limits)
-    sustained_factor=0.80,  # 80% retained (20% loss in sustained workload)
-)  # Overall: 0.60 * 0.70 * 0.80 = 0.336 (33.6% of desktop performance)
+GAMING = LaptopThermalFactor(
+    name="gaming",
+    factor=0.75,
+    notes="Typical 17-inch gaming laptops; dual-fan cooling, mid-range TGP.",
+)
 
-# Optimistic factors (good cooling, high TDP laptops)
-OPTIMISTIC_FACTORS = LaptopAdjustmentFactors(
-    thermal_factor=0.70,  # 70% retained (30% loss to thermal throttling)
-    power_factor=0.80,     # 80% retained (20% loss to power limits)
-    sustained_factor=0.90,  # 90% retained (10% loss in sustained workload)
-)  # Overall: 0.70 * 0.80 * 0.90 = 0.504 (50.4% of desktop performance)
+WORKSTATION = LaptopThermalFactor(
+    name="workstation",
+    factor=0.85,
+    notes="High-TDP workstation/mobile-RTX-A laptops with vapor-chamber cooling.",
+)
 
-# Validated factor (RTX 5060 Laptop actual measurement)
-VALIDATED_RTX_5060_LAPTOP = LaptopAdjustmentFactors(
-    thermal_factor=0.45,  # Observed severe thermal throttling
-    power_factor=0.50,     # 115W vs 200W+ desktop
-    sustained_factor=0.32,  # Long benchmark run (10+ minutes)
-)  # Overall: 0.45 * 0.50 * 0.32 = 0.072 (7.2% - matches validation!)
+_PROFILES: dict[LaptopProfile, LaptopThermalFactor] = {
+    "thin-and-light": THIN_AND_LIGHT,
+    "gaming": GAMING,
+    "workstation": WORKSTATION,
+}
 
 
 def is_laptop_gpu(gpu_model: str) -> bool:
-    """
-    Detect if a GPU is a laptop variant.
-
-    Args:
-        gpu_model: GPU model string (e.g., "RTX-5060-Laptop")
-
-    Returns:
-        True if laptop GPU, False otherwise
-    """
-    laptop_indicators = [
-        "-Laptop",
-        "-Mobile",
-        " Laptop",
-        " Mobile",
-        " Max-Q",
-    ]
-
+    """True if ``gpu_model`` is a laptop / mobile variant."""
     model_upper = gpu_model.upper()
-    return any(indicator.upper() in model_upper for indicator in laptop_indicators)
+    return any(
+        indicator in model_upper
+        for indicator in ("-LAPTOP", "-MOBILE", " LAPTOP", " MOBILE", " MAX-Q")
+    )
 
 
-def get_laptop_adjustment_factor(
-    gpu_model: str,
-    profile: str = "balanced",
+def get_laptop_thermal_factor(
+    gpu_model: str, profile: LaptopProfile = "gaming"
 ) -> float:
-    """
-    Get performance adjustment factor for laptop GPU.
-
-    Args:
-        gpu_model: GPU model string
-        profile: Adjustment profile ("conservative", "balanced", "optimistic", "validated")
-
-    Returns:
-        Performance multiplier (0.0-1.0)
-    """
+    """Return the sustained-thermal factor for a laptop GPU (1.0 for desktops)."""
     if not is_laptop_gpu(gpu_model):
-        return 1.0  # No adjustment for desktop GPUs
-
-    # Use validated factor for RTX 5060 Laptop
-    if "5060" in gpu_model and "Laptop" in gpu_model:
-        return VALIDATED_RTX_5060_LAPTOP.overall_factor
-
-    # Select profile
-    if profile == "conservative":
-        factors = CONSERVATIVE_FACTORS
-    elif profile == "optimistic":
-        factors = OPTIMISTIC_FACTORS
-    elif profile == "validated":
-        # Use validated factor as default for all laptops
-        factors = VALIDATED_RTX_5060_LAPTOP
-    else:  # balanced (default)
-        factors = BALANCED_FACTORS
-
-    return factors.overall_factor
+        return 1.0
+    return _PROFILES[profile].factor
 
 
 def adjust_performance_metrics(
     gpu_model: str,
     throughput_tokens_per_sec: float,
     latency_ms: float,
-    profile: str = "balanced",
+    profile: LaptopProfile = "gaming",
 ) -> tuple[float, float]:
+    """Scale throughput down and latency up by the laptop thermal factor.
+
+    Returns ``(adjusted_throughput, adjusted_latency_ms)``. Desktop GPUs
+    pass through unchanged.
     """
-    Adjust performance metrics for laptop GPU.
-
-    Args:
-        gpu_model: GPU model string
-        throughput_tokens_per_sec: Predicted throughput
-        latency_ms: Predicted latency
-        profile: Adjustment profile
-
-    Returns:
-        Tuple of (adjusted_throughput, adjusted_latency)
-    """
-    factor = get_laptop_adjustment_factor(gpu_model, profile)
-
-    # Throughput scales linearly with factor
-    adjusted_throughput = throughput_tokens_per_sec * factor
-
-    # Latency increases inversely (slower = higher latency)
-    adjusted_latency = latency_ms / factor if factor > 0 else latency_ms * 100
-
-    return adjusted_throughput, adjusted_latency
+    factor = get_laptop_thermal_factor(gpu_model, profile)
+    return throughput_tokens_per_sec * factor, latency_ms / factor
 
 
-def get_laptop_info(gpu_model: str) -> dict:
-    """
-    Get information about laptop GPU adjustments.
-
-    Args:
-        gpu_model: GPU model string
-
-    Returns:
-        Dictionary with adjustment info
-    """
+def get_laptop_info(
+    gpu_model: str, profile: LaptopProfile = "gaming"
+) -> dict[str, object]:
+    """Human-readable description — what the factor is and why."""
     if not is_laptop_gpu(gpu_model):
         return {
             "is_laptop": False,
-            "adjustment_factor": 1.0,
-            "notes": "Desktop GPU - no adjustment needed",
+            "thermal_factor": 1.0,
+            "notes": "Desktop GPU — no adjustment.",
         }
 
-    factor = get_laptop_adjustment_factor(gpu_model, "balanced")
-
+    prof = _PROFILES[profile]
     return {
         "is_laptop": True,
-        "adjustment_factor": factor,
-        "thermal_impact": "30-50% performance loss",
-        "power_impact": "20-40% performance loss",
-        "sustained_impact": "10-30% performance loss",
-        "combined_impact": f"{(1-factor)*100:.0f}% total performance loss",
-        "notes": (
-            f"Laptop GPUs experience significant performance degradation. "
-            f"Predictions adjusted by {factor:.1%} based on research and validation."
+        "profile": prof.name,
+        "thermal_factor": prof.factor,
+        "notes": prof.notes,
+        "disclaimer": (
+            "Factor applied on top of the laptop SKU's own spec-sheet "
+            "TFLOPS, not a laptop-vs-desktop retention ratio. If you want "
+            "a laptop-vs-desktop comparison, compare the two SKUs' peak "
+            "TFLOPS numbers in gpu_specs.py directly."
         ),
     }

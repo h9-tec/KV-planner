@@ -10,7 +10,7 @@ class TestModelConfig:
 
     def test_create_valid_gqa_model(self, llama3_8b: ModelConfig) -> None:
         """Test creating valid GQA model configuration."""
-        assert llama3_8b.name == "meta-llama/Llama-3-8b-hf"
+        assert llama3_8b.name == "meta-llama/Meta-Llama-3-8B"
         assert llama3_8b.num_layers == 32
         assert llama3_8b.hidden_size == 4096
         assert llama3_8b.num_attention_heads == 32
@@ -141,6 +141,6 @@ class TestModelConfig:
     def test_repr(self, llama3_8b: ModelConfig) -> None:
         """Test string representation."""
         repr_str = repr(llama3_8b)
-        assert "meta-llama/Llama-3-8b-hf" in repr_str
+        assert "meta-llama/Meta-Llama-3-8B" in repr_str
         assert "layers=32" in repr_str
         assert "GQA" in repr_str

@@ -35,7 +35,7 @@ def to_dict(plan: DeploymentPlan) -> dict[str, Any]:
             "num_gpus": plan.hardware.num_gpus,
             "gpu_memory_gb": plan.hardware.gpu_memory_gb,
             "peak_tflops": plan.hardware.peak_tflops,
-            "hbm_bandwidth_gb_s": plan.hardware.hbm_bandwidth_gb_s,
+            "memory_bandwidth_gb_s": plan.hardware.memory_bandwidth_gb_s,
         },
         "recommendations": {
             "precision": plan.recommended_precision,

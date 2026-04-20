@@ -67,24 +67,37 @@ class QuantizationEvaluator:
         baseline_precision: Precision to compare against (default: fp16)
     """
 
-    # Research-validated perplexity impacts (vs FP16 baseline)
+    # Perplexity deltas vs FP16 baseline (PPL points, not percent).
+    # Sources:
+    #   * FP8: NVIDIA TensorRT-LLM & Baseten blog — "no perceptible degradation"
+    #     https://www.baseten.co/blog/33-faster-llm-inference-with-fp8-quantization/
+    #   * INT8 (SmoothQuant): arxiv 2211.10438 — <1 PPL delta on OPT-175B
+    #   * INT4 (AWQ/GPTQ): arxiv 2306.00978, 2210.17323 — typ 0-1 PPL delta on MMLU
+    #     https://jarvislabs.ai/blog/vllm-quantization-complete-guide-benchmarks
     PERPLEXITY_DELTAS = {
-        "fp32": 0.0,    # Reference (actually slightly better than FP16)
-        "fp16": 0.0,    # Baseline
-        "bf16": 0.0,    # Equivalent to FP16 for LLMs
-        "fp8": 0.5,     # Minimal impact (<1% on benchmarks)
-        "int8": 2.0,    # Slight impact (SmoothQuant: ~2% degradation)
-        "int4": 5.0,    # Moderate impact (AWQ/GPTQ: 3-8% degradation)
+        "fp32": 0.0,
+        "fp16": 0.0,
+        "bf16": 0.0,
+        "fp8": 0.3,
+        "int8": 1.0,
+        "int4": 2.5,
     }
 
-    # Speed improvements (memory-bound decode benefits most)
+    # Throughput improvements vs FP16 baseline. These are the default
+    # FALLBACK values used when the Roofline analyzer can't derive a
+    # precision-specific speedup from hardware specs — the real planner
+    # uses the measured throughput ratio from two roofline predictions.
+    # Sources:
+    #   * FP8 1.3-2.0× on H100 (NVIDIA TE, Baseten) — default 1.4
+    #   * INT8 1.6× (vLLM + SmoothQuant on Llama-3.1-70B, Red Hat LLM-Compressor)
+    #   * INT4 2.6-2.8× with Marlin kernel — arxiv 2408.11743
     SPEED_MULTIPLIERS = {
-        "fp32": 0.5,    # Slower (2× more data)
-        "fp16": 1.0,    # Baseline
-        "bf16": 1.0,    # Same as FP16
-        "fp8": 1.33,    # 33% faster (measured in vLLM benchmarks)
-        "int8": 1.5,    # 50% faster (with optimized kernels)
-        "int4": 1.8,    # 80% faster (with optimized kernels, but often kernel-limited)
+        "fp32": 0.5,
+        "fp16": 1.0,
+        "bf16": 1.0,
+        "fp8": 1.4,
+        "int8": 1.6,
+        "int4": 2.6,
     }
 
     # Memory savings (bits per parameter)

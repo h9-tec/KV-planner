@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "kv-planner"
-version = "0.1.0"
+version = "0.2.0"
 description = "KV cache memory and throughput planner for LLM deployment"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -26,23 +26,46 @@ classifiers = [
 
 dependencies = [
     "numpy>=1.24.0",
-    "scipy>=1.10.0",
     "pydantic>=2.0.0",
     "click>=8.1.0",
     "rich>=13.0.0",
-    "plotly>=5.18.0",
     "jinja2>=3.1.0",
     "pyyaml>=6.0.0",
 ]
 
 [project.optional-dependencies]
+# Chart generation (optional; presentation layer not required for CLI/core).
+plots = ["plotly>=5.18.0"]
+# SciPy only needed if you wire up optimization/statistics helpers; the core
+# roofline math uses pure Python.
+stats = ["scipy>=1.10.0"]
+# HuggingFace integration (pull model configs from HF Hub).
 hf = [
     "transformers>=4.40.0",
     "huggingface-hub>=0.20.0",
 ]
-vllm = [
-    "vllm>=0.5.0",
+# Real vLLM benchmark integration.
+vllm = ["vllm>=0.5.0"]
+# Terminal UI (Vim-keyed llmfit-style) + REST dashboard.
+tui = [
+    "rich>=13.7",
+    "prompt_toolkit>=3.0.47",
+    "fastapi>=0.109",
+    "uvicorn>=0.27",
 ]
+# Training / fine-tuning via Unsloth + TRL + PEFT. CUDA + torch 2.2+ required.
+train = [
+    "torch>=2.2.0",
+    "transformers>=4.46.0",
+    "datasets>=2.16.0",
+    "accelerate>=0.33.0",
+    "peft>=0.13.0",
+    "trl>=0.12.0",
+    "bitsandbytes>=0.44.0",
+    "unsloth>=2024.11",
+    "xformers>=0.0.28; platform_system == 'Linux'",
+]
+# Developer toolchain.
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
@@ -94,15 +117,15 @@ warn_no_return = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
+# Coverage is opt-in via: pytest --cov=kv_planner --cov-report=term-missing
+# This keeps the default `pytest` invocation working even without pytest-cov installed.
 addopts = [
     "-v",
     "--strict-markers",
-    "--cov=kv_planner",
-    "--cov-report=term-missing",
-    "--cov-report=html",
 ]
 
 [tool.coverage.run]

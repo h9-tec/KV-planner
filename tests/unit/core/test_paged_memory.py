@@ -16,7 +16,7 @@ class TestPagedMemoryCalculator:
 
     @pytest.fixture
     def calculator_with_hardware(self, h100_4x: HardwareSpec) -> PagedMemoryCalculator:
-        """Calculator with hardware for super-linear scaling."""
+        """Calculator with hardware context (TP shard math is handled by caller)."""
         return PagedMemoryCalculator(block_size=16, hardware=h100_4x)
 
     def test_block_size_validation(self) -> None:
@@ -32,8 +32,7 @@ class TestPagedMemoryCalculator:
         calculator: PagedMemoryCalculator,
         llama3_8b: ModelConfig,
     ) -> None:
-        """Test KV cache calculation when sequence length divides evenly into blocks."""
-        # 2048 tokens = 128 blocks × 16 tokens/block (exact)
+        """Exact-multiple seq length: no waste, no bogus 4% multiplier."""
         kv_bytes = calculator.calculate_kv_cache_size(
             batch_size=1,
             sequence_length=2048,
@@ -41,57 +40,42 @@ class TestPagedMemoryCalculator:
             precision="fp16",
         )
 
-        # Expected: 128 blocks × (16 tokens/block × 131,072 bytes/token)
-        blocks = 2048 // 16
-        bytes_per_block = 16 * llama3_8b.kv_cache_bytes_per_token("fp16")
-        expected_base = blocks * bytes_per_block
-        expected_with_overhead = int(expected_base * 1.04)  # +4% fragmentation
-
-        assert kv_bytes == expected_with_overhead
+        # 2048 tokens ÷ 16 tokens/block = 128 blocks, exact fit.
+        # Per vLLM: 131,072 bytes/token fp16 for Llama-3 8B.
+        expected = 2048 * llama3_8b.kv_cache_bytes_per_token("fp16")
+        assert kv_bytes == expected
 
     def test_calculate_kv_cache_partial_block(
         self,
         calculator: PagedMemoryCalculator,
         llama3_8b: ModelConfig,
     ) -> None:
-        """Test KV cache calculation with partial block usage."""
-        # 17 tokens = 2 blocks × 16 tokens/block (wastes 15 tokens in last block)
+        """Partial last block: exactly one extra block allocated, no 4% on top."""
         kv_bytes = calculator.calculate_kv_cache_size(
             batch_size=1,
             sequence_length=17,
             model=llama3_8b,
             precision="fp16",
         )
-
-        # Expected: 2 blocks
-        blocks = 2
-        bytes_per_block = 16 * llama3_8b.kv_cache_bytes_per_token("fp16")
-        expected_base = blocks * bytes_per_block
-        expected_with_overhead = int(expected_base * 1.04)
-
-        assert kv_bytes == expected_with_overhead
+        # 17 tokens -> ceil(17/16) = 2 blocks = 32 token-slots allocated.
+        # The "fragmentation" is purely the 15 unused token-slots in the last block.
+        expected = 2 * 16 * llama3_8b.kv_cache_bytes_per_token("fp16")
+        assert kv_bytes == expected
 
     def test_calculate_kv_cache_batch(
         self,
         calculator: PagedMemoryCalculator,
         llama3_8b: ModelConfig,
     ) -> None:
-        """Test KV cache calculation with batching."""
-        # 32 sequences × 2048 tokens
+        """Batch allocation is strictly linear in batch size (no frag multiplier)."""
         kv_bytes = calculator.calculate_kv_cache_size(
             batch_size=32,
             sequence_length=2048,
             model=llama3_8b,
             precision="fp16",
         )
-
-        # Expected: 32 × 128 blocks = 4096 blocks
-        blocks = 32 * (2048 // 16)
-        bytes_per_block = 16 * llama3_8b.kv_cache_bytes_per_token("fp16")
-        expected_base = blocks * bytes_per_block
-        expected_with_overhead = int(expected_base * 1.04)
-
-        assert kv_bytes == expected_with_overhead
+        expected = 32 * 2048 * llama3_8b.kv_cache_bytes_per_token("fp16")
+        assert kv_bytes == expected
 
     def test_precision_scaling(
         self,
@@ -141,33 +125,18 @@ class TestPagedMemoryCalculator:
         )
         assert kv_bytes <= available_memory_gb * 1e9
 
-    def test_max_batch_size_with_super_linear_scaling(
+    def test_max_batch_size_is_linear_in_memory(
         self,
-        calculator_with_hardware: PagedMemoryCalculator,
+        calculator: PagedMemoryCalculator,
         llama3_8b: ModelConfig,
     ) -> None:
-        """Test that super-linear scaling increases max batch size."""
-        calculator_no_hw = PagedMemoryCalculator(block_size=16, hardware=None)
-        calculator_with_hw = calculator_with_hardware
-
-        available_memory_gb = 40.0
-
-        max_batch_no_hw = calculator_no_hw.max_batch_size(
-            available_memory_gb=available_memory_gb,
-            sequence_length=2048,
-            model=llama3_8b,
-            precision="fp16",
-        )
-
-        max_batch_with_hw = calculator_with_hw.max_batch_size(
-            available_memory_gb=available_memory_gb,
-            sequence_length=2048,
-            model=llama3_8b,
-            precision="fp16",
-        )
-
-        # With TP=4, should get significantly more capacity due to super-linear scaling
-        assert max_batch_with_hw > max_batch_no_hw
+        """Memory → batch is strictly linear. Supplying hardware context does
+        not magically grant extra capacity (the old "super-linear" shortcut
+        that returned 13.9× for TP=2 was physically bogus and has been removed)."""
+        mb1 = calculator.max_batch_size(40.0, 2048, llama3_8b, "fp16")
+        mb2 = calculator.max_batch_size(80.0, 2048, llama3_8b, "fp16")
+        # Exactly 2× more memory → exactly 2× more batch capacity.
+        assert mb2 == 2 * mb1
 
     def test_max_sequence_length(
         self,

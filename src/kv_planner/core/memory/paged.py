@@ -1,53 +1,43 @@
 """
 PagedAttention-based memory calculator.
 
-Implements vLLM's PagedAttention algorithm for KV cache management,
-achieving <4% memory fragmentation vs 60-80% in naive allocation.
+Models vLLM's PagedAttention block-based KV cache allocation. The only
+fragmentation source is **internal**: the last (potentially partially-used)
+block of each sequence. External fragmentation is zero by construction
+(all blocks are the same fixed size). vLLM reports <4 % waste in practice,
+and that figure is the *total* — no additional overhead is layered on.
 
 Reference:
-    Efficient Memory Management for Large Language Model Serving with PagedAttention
-    https://arxiv.org/abs/2309.06180
+    Kwon et al., 2023 — "Efficient Memory Management for Large Language Model
+    Serving with PagedAttention". https://arxiv.org/abs/2309.06180
 """
 
+from __future__ import annotations
+
 import logging
-from typing import Literal, Optional
+import math
+from typing import Optional
 
-from kv_planner.domain import ModelConfig, HardwareSpec
+from kv_planner.domain import HardwareSpec, ModelConfig, PrecisionType
 from kv_planner.domain.exceptions import InsufficientMemoryError
-
-PrecisionType = Literal["fp32", "fp16", "bf16", "fp8", "int8", "int4"]
 
 
 class PagedMemoryCalculator:
     """
-    PagedAttention-based memory calculator for KV cache.
+    Block-granularity KV cache size calculator.
 
-    Uses block-based allocation (16 tokens per block by default)
-    to minimize fragmentation and enable near-optimal memory utilization.
-
-    Attributes:
-        block_size: Number of tokens per block (default: 16, vLLM standard)
-        fragmentation_overhead: Memory overhead from block granularity (<4%)
+    Internal fragmentation = (blocks · block_size − actual_tokens) per
+    sequence. At long context and the vLLM default block_size=16, this is
+    ``< block_size / avg_seq_len`` in the limit (≤4 % for avg_seq_len ≥ 400).
     """
 
-    DEFAULT_BLOCK_SIZE = 16  # vLLM default
-    FRAGMENTATION_OVERHEAD = 0.04  # <4% waste (measured from vLLM)
+    DEFAULT_BLOCK_SIZE = 16  # vLLM platform-default on CUDA
 
     def __init__(
         self,
         block_size: int = DEFAULT_BLOCK_SIZE,
         hardware: Optional[HardwareSpec] = None,
-    ):
-        """
-        Initialize PagedMemoryCalculator.
-
-        Args:
-            block_size: Tokens per block (default: 16)
-            hardware: Optional hardware spec for super-linear scaling
-
-        Raises:
-            ValueError: If block_size is not positive
-        """
+    ) -> None:
         if block_size <= 0:
             raise ValueError(f"block_size must be positive, got {block_size}")
 
@@ -62,49 +52,33 @@ class PagedMemoryCalculator:
         model: ModelConfig,
         precision: PrecisionType = "fp16",
     ) -> int:
-        """
-        Calculate total KV cache size with block-level granularity.
+        """Return total KV cache bytes for a batch at a given sequence length.
 
-        Formula:
-            blocks_per_seq = ceil(sequence_length / block_size)
-            total_blocks = batch_size × blocks_per_seq
-            block_bytes = block_size × model.kv_cache_bytes_per_token(precision)
-            total_bytes = total_blocks × block_bytes × (1 + fragmentation)
+        Formula::
 
-        Args:
-            batch_size: Number of sequences in batch
-            sequence_length: Length of each sequence
-            model: Model configuration
-            precision: KV cache precision
+            blocks_per_seq = ceil(seq_len / block_size)
+            total_bytes    = batch · blocks_per_seq · block_size · kv_bytes_per_token
 
-        Returns:
-            Total KV cache size in bytes
-
-        Raises:
-            ValueError: If batch_size or sequence_length invalid
+        That is the only fragmentation term — we do NOT multiply by
+        (1 + 0.04): the ceil already accounts for the partial last block and
+        that matches what vLLM reports.
         """
         self._validate_inputs(batch_size, sequence_length)
 
-        # Calculate blocks needed per sequence (ceiling division)
         blocks_per_seq = self._blocks_needed(sequence_length)
-
-        # Total blocks across batch
         total_blocks = batch_size * blocks_per_seq
-
-        # Bytes per block
-        block_bytes = self._block_size * model.kv_cache_bytes_per_token(precision)
-
-        # Total with fragmentation overhead
-        total_bytes = total_blocks * block_bytes
-        effective_bytes = int(total_bytes * (1 + self.FRAGMENTATION_OVERHEAD))
+        bytes_per_token = model.kv_cache_bytes_per_token(precision)
+        total_bytes = total_blocks * self._block_size * bytes_per_token
 
         self._logger.debug(
-            f"KV cache: {batch_size}×{sequence_length} tokens = "
-            f"{total_blocks} blocks ({blocks_per_seq} per seq) = "
-            f"{effective_bytes / 1e9:.3f} GB"
+            "KV cache: %d×%d tokens = %d blocks (%d per seq) = %.3f GB",
+            batch_size,
+            sequence_length,
+            total_blocks,
+            blocks_per_seq,
+            total_bytes / 1e9,
         )
-
-        return effective_bytes
+        return int(total_bytes)
 
     def max_batch_size(
         self,
@@ -113,43 +87,21 @@ class PagedMemoryCalculator:
         model: ModelConfig,
         precision: PrecisionType = "fp16",
     ) -> int:
-        """
-        Calculate maximum batch size for given memory constraint.
+        """Largest batch size that fits in ``available_memory_gb``.
 
-        Accounts for:
-        - Block-level allocation granularity
-        - Fragmentation overhead
-        - Super-linear scaling with tensor parallelism (if hardware provided)
-
-        Args:
-            available_memory_gb: Available memory in GB
-            sequence_length: Target sequence length
-            model: Model configuration
-            precision: KV cache precision
-
-        Returns:
-            Maximum batch size that fits in memory
-
-        Raises:
-            ValueError: If inputs invalid
-            InsufficientMemoryError: If cannot fit even 1 sequence
+        No super-linear scaling is applied — memory scales linearly with
+        tensor-parallel size, and the correct way to express "more room for
+        KV cache because weights are sharded" is to pass the already-reduced
+        ``available_memory_gb`` the caller computed from
+        :meth:`HardwareSpec.available_kv_cache_memory_gb`.
         """
         self._validate_inputs(1, sequence_length)
 
         if available_memory_gb <= 0:
-            raise ValueError(f"available_memory_gb must be positive, got {available_memory_gb}")
-
-        # Apply super-linear scaling if hardware available
-        effective_memory_gb = available_memory_gb
-        if self._hardware is not None:
-            scaling_factor = self._hardware.kv_cache_super_linear_scaling_factor()
-            effective_memory_gb *= scaling_factor
-            self._logger.debug(
-                f"Applied super-linear scaling: {scaling_factor:.1f}× "
-                f"({available_memory_gb:.1f} GB → {effective_memory_gb:.1f} GB effective)"
+            raise ValueError(
+                f"available_memory_gb must be positive, got {available_memory_gb}"
             )
 
-        # Calculate memory per sequence
         memory_per_seq_bytes = self.calculate_kv_cache_size(
             batch_size=1,
             sequence_length=sequence_length,
@@ -157,8 +109,7 @@ class PagedMemoryCalculator:
             precision=precision,
         )
 
-        # Maximum batch size
-        max_batch = int(effective_memory_gb * 1e9 / memory_per_seq_bytes)
+        max_batch = int(available_memory_gb * 1e9 / memory_per_seq_bytes)
 
         if max_batch < 1:
             raise InsufficientMemoryError(
@@ -166,11 +117,6 @@ class PagedMemoryCalculator:
                 f"in {available_memory_gb:.2f} GB memory. "
                 f"Required: {memory_per_seq_bytes / 1e9:.2f} GB"
             )
-
-        self._logger.debug(
-            f"Max batch size: {max_batch} "
-            f"(seq_len={sequence_length}, mem={available_memory_gb:.1f} GB)"
-        )
 
         return max_batch
 
@@ -181,70 +127,32 @@ class PagedMemoryCalculator:
         model: ModelConfig,
         precision: PrecisionType = "fp16",
     ) -> int:
-        """
-        Calculate maximum sequence length for given memory constraint.
+        """Largest sequence length that fits for a given batch size.
 
-        Uses binary search to find the largest sequence length that fits.
-
-        Args:
-            available_memory_gb: Available memory in GB
-            batch_size: Target batch size
-            model: Model configuration
-            precision: KV cache precision
-
-        Returns:
-            Maximum sequence length in tokens
-
-        Raises:
-            ValueError: If inputs invalid
-            InsufficientMemoryError: If cannot fit batch_size with any length
+        Closed form (no binary search needed): invert the block-granularity
+        formula to ``floor(mem / (batch · bytes_per_token)) `` rounded down
+        to a block multiple.
         """
         self._validate_inputs(batch_size, 1)
 
         if available_memory_gb <= 0:
-            raise ValueError(f"available_memory_gb must be positive, got {available_memory_gb}")
+            raise ValueError(
+                f"available_memory_gb must be positive, got {available_memory_gb}"
+            )
 
-        # Apply super-linear scaling
-        effective_memory_gb = available_memory_gb
-        if self._hardware is not None:
-            scaling_factor = self._hardware.kv_cache_super_linear_scaling_factor()
-            effective_memory_gb *= scaling_factor
+        bytes_per_token = model.kv_cache_bytes_per_token(precision)
+        budget_bytes = available_memory_gb * 1e9
 
-        # Binary search for maximum sequence length
-        # Upper bound: assume 1 byte per token (very conservative)
-        left, right = self._block_size, int(effective_memory_gb * 1e9 / batch_size)
-
-        max_seq_length = 0
-
-        while left <= right:
-            mid = (left + right) // 2
-
-            try:
-                kv_bytes = self.calculate_kv_cache_size(
-                    batch_size=batch_size,
-                    sequence_length=mid,
-                    model=model,
-                    precision=precision,
-                )
-
-                if kv_bytes <= effective_memory_gb * 1e9:
-                    max_seq_length = mid
-                    left = mid + 1  # Try longer
-                else:
-                    right = mid - 1  # Try shorter
-
-            except Exception:
-                right = mid - 1
+        # Each added block costs batch · block_size · bytes_per_token
+        bytes_per_block = batch_size * self._block_size * bytes_per_token
+        max_blocks_per_seq = int(budget_bytes // bytes_per_block)
+        max_seq_length = max_blocks_per_seq * self._block_size
 
         if max_seq_length < self._block_size:
             raise InsufficientMemoryError(
-                f"Cannot fit batch_size={batch_size} in {available_memory_gb:.2f} GB"
+                f"Cannot fit batch_size={batch_size} at block size "
+                f"{self._block_size} in {available_memory_gb:.2f} GB"
             )
-
-        self._logger.debug(
-            f"Max sequence length: {max_seq_length} "
-            f"(batch={batch_size}, mem={available_memory_gb:.1f} GB)"
-        )
 
         return max_seq_length
 
@@ -255,21 +163,13 @@ class PagedMemoryCalculator:
         model: ModelConfig,
         precision: PrecisionType = "fp16",
     ) -> dict[str, float]:
-        """
-        Get detailed memory breakdown.
-
-        Returns:
-            Dictionary with memory usage breakdown in GB
-        """
+        """Detailed memory accounting for debugging / reporting."""
         kv_bytes = self.calculate_kv_cache_size(batch_size, sequence_length, model, precision)
         blocks_per_seq = self._blocks_needed(sequence_length)
         total_blocks = batch_size * blocks_per_seq
 
-        # Actual tokens stored
         actual_tokens = batch_size * sequence_length
-        # Allocated tokens (due to block granularity)
         allocated_tokens = total_blocks * self._block_size
-        # Wasted tokens
         wasted_tokens = allocated_tokens - actual_tokens
 
         return {
@@ -279,32 +179,15 @@ class PagedMemoryCalculator:
             "tokens_actual": actual_tokens,
             "tokens_allocated": allocated_tokens,
             "tokens_wasted": wasted_tokens,
-            "fragmentation_pct": (wasted_tokens / allocated_tokens * 100) if allocated_tokens > 0 else 0,
+            "fragmentation_pct": (
+                (wasted_tokens / allocated_tokens * 100) if allocated_tokens > 0 else 0.0
+            ),
         }
 
     def _blocks_needed(self, sequence_length: int) -> int:
-        """
-        Calculate number of blocks needed for sequence (ceiling division).
-
-        Args:
-            sequence_length: Sequence length in tokens
-
-        Returns:
-            Number of blocks (ceil(sequence_length / block_size))
-        """
-        return (sequence_length + self._block_size - 1) // self._block_size
+        return math.ceil(sequence_length / self._block_size)
 
     def _validate_inputs(self, batch_size: int, sequence_length: int) -> None:
-        """
-        Validate input parameters.
-
-        Args:
-            batch_size: Batch size to validate
-            sequence_length: Sequence length to validate
-
-        Raises:
-            ValueError: If inputs are invalid
-        """
         if batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {batch_size}")
         if sequence_length <= 0:
@@ -312,10 +195,4 @@ class PagedMemoryCalculator:
 
     @property
     def block_size(self) -> int:
-        """Get block size."""
         return self._block_size
-
-    @property
-    def fragmentation_overhead(self) -> float:
-        """Get fragmentation overhead fraction."""
-        return self.FRAGMENTATION_OVERHEAD

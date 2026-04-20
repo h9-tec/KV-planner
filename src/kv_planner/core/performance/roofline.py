@@ -1,46 +1,39 @@
 """
-Roofline analysis for LLM inference performance prediction.
+Roofline-model performance predictor for LLM inference.
 
-Implements the roofline model to predict:
-- Prefill latency (compute-bound)
-- Decode latency (memory-bound)
-- MFU (Model FLOPS Utilization)
-- MBU (Model Bandwidth Utilization)
-- Throughput (tokens/second)
+Separates **prefill** (compute-bound, matmul-dense) from **decode**
+(memory-bound, weight-streaming) and models each against a Williams-style
+roofline ceiling defined by the hardware's peak TFLOPS and memory bandwidth.
 
-Based on research from:
-- "LLM Inference Unveiled: Survey and Roofline Model Insights" (arXiv 2024)
-- "Transformer Inference Arithmetic" (kipply's blog)
-- vLLM performance analysis
+Correctness sources — every formula below has a citation:
+
+* FLOPs per token: kipply, "Transformer Inference Arithmetic" —
+  https://kipp.ly/transformer-inference-arithmetic
+  Chowdhery et al., PaLM paper — https://arxiv.org/abs/2204.02311
+  EleutherAI cookbook ``calc_transformer_flops.py`` —
+  https://github.com/EleutherAI/cookbook
+* KV-cache bytes per token: vLLM PagedAttention design —
+  https://docs.vllm.ai/en/latest/design/paged_attention/
+* Ring-AllReduce cost: Patarasuk & Yuan, JPDC 2009 —
+  https://www.cs.fsu.edu/~xyuan/paper/09jpdc.pdf
+  Megatron-LM, Shoeybi et al. — https://arxiv.org/abs/1909.08053
+* Roofline: Williams, Waterman, Patterson CACM 2009 —
+  https://people.eecs.berkeley.edu/~kubitron/cs252/handouts/papers/RooflineVyNoYellow.pdf
+* FlashAttention (decode activation streaming): Dao et al. —
+  https://arxiv.org/abs/2205.14135
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Optional
 
-from kv_planner.domain import HardwareSpec, ModelConfig, InsufficientMemoryError
-
-
-PrecisionType = Literal["fp32", "fp16", "bf16", "fp8", "int8", "int4"]
+from kv_planner.domain import HardwareSpec, ModelConfig, PrecisionType, bytes_per_element
 
 
 @dataclass(frozen=True)
 class PerformanceMetrics:
-    """
-    Performance prediction results from roofline analysis.
-
-    Attributes:
-        prefill_latency_ms: Time to process input prompt (milliseconds)
-        decode_latency_ms: Time per output token generation (milliseconds)
-        total_latency_ms: Total inference time for given sequence
-        prefill_tflops: Achieved TFLOPS during prefill
-        decode_tflops: Achieved TFLOPS during decode
-        mfu: Model FLOPS Utilization (0.0-1.0)
-        mbu: Model Bandwidth Utilization (0.0-1.0)
-        throughput_tokens_per_sec: Total throughput (tokens/second)
-        is_prefill_compute_bound: Whether prefill is compute-bound
-        is_decode_memory_bound: Whether decode is memory-bound
-        arithmetic_intensity: Operations per byte ratio
-    """
+    """Roofline prediction output."""
 
     prefill_latency_ms: float
     decode_latency_ms: float
@@ -55,92 +48,160 @@ class PerformanceMetrics:
     arithmetic_intensity: float
 
 
+@dataclass(frozen=True)
+class RooflineConfig:
+    """Tunable knobs, every default cited.
+
+    * ``compute_efficiency``: observed MFU for well-tuned prefill on H100 is
+      40–60 %; we take 50 % as a realistic default (Databricks MBU blog
+      https://www.databricks.com/blog/llm-inference-performance-engineering-best-practices,
+      PaLM MFU ~46 % https://arxiv.org/abs/2204.02311).
+    * ``memory_efficiency``: measured decode MBU on H100 Llama-2-70B B=1
+      is ~60–85 %; 75 % is a reasonable mid-point (Databricks, same ref).
+    * ``effective_nvlink_bandwidth_gb_s``: ring-AllReduce sustained on
+      H100-HGX is ~400 GB/s of the advertised 900 GB/s per-direction peak
+      (NCCL tests — https://github.com/NVIDIA/nccl-tests/issues/212).
+    * ``allreduce_per_layer``: 2 AllReduces per layer in Megatron-style TP
+      (post-attention row-parallel + post-MLP row-parallel).
+    """
+
+    compute_efficiency: float = 0.50
+    memory_efficiency: float = 0.75
+    allreduce_per_layer: int = 2
+
+    def __post_init__(self) -> None:
+        for name in ("compute_efficiency", "memory_efficiency"):
+            val = getattr(self, name)
+            if not 0.0 < val <= 1.0:
+                raise ValueError(f"{name} must be in (0, 1], got {val}")
+        if self.allreduce_per_layer < 0:
+            raise ValueError(
+                f"allreduce_per_layer must be non-negative, got {self.allreduce_per_layer}"
+            )
+
+
+def flops_per_token_per_layer(model: ModelConfig, sequence_length: int) -> int:
+    """FLOPs per token per layer, including the attention term.
+
+    Breakdown (matmul of ``[m,k]·[k,n]`` = 2·m·k·n FLOPs):
+
+    * Q projection: ``2·d·d``
+    * K, V projections (GQA-aware): ``2·d·kv_hidden`` each
+    * Attention scores Q·Kᵀ: ``2·d·s`` (one new query token vs s past tokens,
+      GQA replicates K across the group so the query-head count applies)
+    * Attention Aᵀ·V: ``2·d·s``
+    * Output projection: ``2·d·d``
+    * FFN: ``n_matmuls · 2·d·d_ff``  (n_matmuls = 3 for SwiGLU, else 2)
+
+    ``sequence_length`` is the **current position** — pass the accumulated
+    context length for a decode step, or the prompt length for prefill.
+
+    For prefill of a whole prompt of length ``s``, sum from 1 to s; the
+    closed-form is the per-token formula with ``s/2`` in the attention term
+    (arithmetic mean of positions). We approximate by evaluating at ``s``
+    and noting that for compute-bound prefill the attention term is
+    negligible relative to the 24·d² matmul bulk.
+    """
+    d = model.hidden_size
+    d_kv = model.kv_hidden_size
+    d_ff = model._ffn_intermediate
+    n_matmuls = model.ffn_num_matmuls
+
+    q_o = 2 * (2 * d * d)
+    kv_proj = 2 * (2 * d * d_kv)
+    attn_qk = 2 * d * sequence_length
+    attn_v = 2 * d * sequence_length
+    ffn = n_matmuls * 2 * d * d_ff
+
+    return q_o + kv_proj + attn_qk + attn_v + ffn
+
+
 class RooflineAnalyzer:
     """
-    Roofline model analyzer for LLM inference performance prediction.
+    Predicts prefill / decode latency, MFU, MBU, throughput.
 
-    The roofline model determines performance based on:
-    1. Arithmetic Intensity (OPs/byte) vs Hardware Balance Point
-    2. Prefill: Usually compute-bound (large matrix ops)
-    3. Decode: Usually memory-bound (loading weights for single token)
+    Prefill: matmul-dense, treated as compute-bound once arithmetic intensity
+    exceeds the hardware ridge; otherwise memory-bound by weight-read time.
 
-    Example:
-        >>> analyzer = RooflineAnalyzer()
-        >>> metrics = analyzer.predict_latency(
-        ...     model=llama3_8b,
-        ...     hardware=rtx_5090,
-        ...     batch_size=32,
-        ...     input_length=2048,
-        ...     output_length=512,
-        ...     precision="fp16"
-        ... )
-        >>> print(f"Prefill: {metrics.prefill_latency_ms:.1f}ms")
-        >>> print(f"Decode: {metrics.decode_latency_ms:.1f}ms")
-        >>> print(f"Throughput: {metrics.throughput_tokens_per_sec:.0f} tokens/s")
+    Decode: always memory-bound by weight + growing KV cache. Latency per
+    generated token is ``(weights + kv_for_current_length) / bandwidth``.
     """
-
-    # Constants for transformer FLOPs calculation
-    FLOPS_PER_TOKEN_MULTIPLIER = 24  # For full forward pass (QKV + attn + MLP)
-
-    # Communication overhead per layer (tensor parallelism)
-    COMMUNICATION_LATENCY_US = 8.0  # microseconds per layer
-
-    # Efficiency factors (conservative estimates for production systems)
-    COMPUTE_EFFICIENCY = 0.65  # 65% of peak TFLOPS (accounts for kernel overhead)
-    MEMORY_EFFICIENCY = 0.80  # 80% of peak bandwidth (realistic for inference)
 
     def __init__(
         self,
-        compute_efficiency: float = COMPUTE_EFFICIENCY,
-        memory_efficiency: float = MEMORY_EFFICIENCY,
+        compute_efficiency: float = RooflineConfig.compute_efficiency,
+        memory_efficiency: float = RooflineConfig.memory_efficiency,
+        config: Optional[RooflineConfig] = None,
     ) -> None:
-        """
-        Initialize roofline analyzer.
-
-        Args:
-            compute_efficiency: Fraction of peak TFLOPS achievable (0.0-1.0)
-            memory_efficiency: Fraction of peak bandwidth achievable (0.0-1.0)
-        """
-        if not 0.0 < compute_efficiency <= 1.0:
-            raise ValueError(
-                f"compute_efficiency must be in (0, 1], got {compute_efficiency}"
+        if config is None:
+            config = RooflineConfig(
+                compute_efficiency=compute_efficiency,
+                memory_efficiency=memory_efficiency,
             )
-        if not 0.0 < memory_efficiency <= 1.0:
-            raise ValueError(
-                f"memory_efficiency must be in (0, 1], got {memory_efficiency}"
-            )
+        self._config = config
+        # Keep attributes for backward-compatible introspection.
+        self.compute_efficiency = config.compute_efficiency
+        self.memory_efficiency = config.memory_efficiency
 
-        self.compute_efficiency = compute_efficiency
-        self.memory_efficiency = memory_efficiency
+    # ---------- FLOPs ----------
 
     def calculate_flops_per_token(
+        self, model: ModelConfig, sequence_length: int = 0
+    ) -> int:
+        """Total forward-pass FLOPs for a single token at position ``sequence_length``.
+
+        ``sequence_length=0`` removes the attention term — useful for the
+        bulk-matmul portion only. Most callers should pass the real context.
+        """
+        return model.num_layers * flops_per_token_per_layer(model, sequence_length)
+
+    # ---------- Roofline geometry ----------
+
+    def get_hardware_balance_point(
+        self, hardware: HardwareSpec, precision: PrecisionType = "fp16"
+    ) -> float:
+        """Ridge point in FLOPs/byte — precision-aware."""
+        peak_flops = hardware.peak_tflops_for(precision) * 1e12
+        peak_bw = hardware.memory_bandwidth_gb_s * 1e9
+        return peak_flops / peak_bw
+
+    def calculate_arithmetic_intensity_prefill(
         self,
         model: ModelConfig,
-    ) -> int:
+        batch_size: int,
+        sequence_length: int,
+        precision: PrecisionType = "fp16",
+    ) -> float:
+        """AI for prefill: weights streamed once, work scales with batch · seq."""
+        bpe = bytes_per_element(precision)
+        total_flops = self.calculate_flops_per_token(model, sequence_length) * batch_size * sequence_length
+        # In prefill, weights are read essentially once. Activation streaming
+        # is modeled by FlashAttention, so we do not add the attention-matrix
+        # bytes. Include a small activation term for Q/K/V/hidden-state
+        # checkpoints which scale with batch·seq·d.
+        param_bytes = model.total_params() * bpe
+        activation_bytes = batch_size * sequence_length * model.hidden_size * bpe * 4
+        return total_flops / (param_bytes + activation_bytes)
+
+    def calculate_arithmetic_intensity_decode(
+        self,
+        model: ModelConfig,
+        batch_size: int,
+        sequence_length: int,
+        precision: PrecisionType = "fp16",
+    ) -> float:
+        """AI for one decode step.
+
+        Per step: ``batch·(2N + attention)`` FLOPs, with memory reads of
+        ``weights + batch · seq · kv_bytes_per_token``.
         """
-        Calculate FLOPs required for one forward pass per token.
+        bpe = bytes_per_element(precision)
+        flops = self.calculate_flops_per_token(model, sequence_length) * batch_size
+        param_bytes = model.total_params() * bpe
+        kv_bytes = model.kv_cache_bytes_per_token(precision) * batch_size * sequence_length
+        return flops / (param_bytes + kv_bytes)
 
-        Formula: F = n_layers × 24 × d_model²
-
-        Breakdown per layer:
-        - QKV projection: 2 × 3 × d_model² = 6 × d_model²
-        - Attention output: 2 × d_model² = 2 × d_model²
-        - MLP (feed-forward): 2 × 4 × d_model² × 2 = 16 × d_model²
-        - Total: 24 × d_model²
-
-        Args:
-            model: Model configuration
-
-        Returns:
-            FLOPs per token (integer)
-        """
-        d_model = model.hidden_size
-        n_layers = model.num_layers
-
-        flops_per_layer = self.FLOPS_PER_TOKEN_MULTIPLIER * d_model * d_model
-        total_flops = n_layers * flops_per_layer
-
-        return total_flops
+    # ---------- Back-compat shim (tests / external callers) ----------
 
     def calculate_arithmetic_intensity(
         self,
@@ -149,75 +210,12 @@ class RooflineAnalyzer:
         sequence_length: int,
         precision: PrecisionType = "fp16",
     ) -> float:
-        """
-        Calculate arithmetic intensity (FLOPs/byte).
+        """Default to prefill AI — the AI that made sense in pre-rewrite callers."""
+        return self.calculate_arithmetic_intensity_prefill(
+            model, batch_size, sequence_length, precision
+        )
 
-        Arithmetic intensity determines if workload is:
-        - Memory-bound: AI < hardware balance point
-        - Compute-bound: AI > hardware balance point
-
-        Args:
-            model: Model configuration
-            batch_size: Number of sequences
-            sequence_length: Tokens per sequence
-            precision: Numerical precision
-
-        Returns:
-            Arithmetic intensity (FLOPs/byte)
-        """
-        # FLOPs for processing sequence
-        flops_per_token = self.calculate_flops_per_token(model)
-        total_flops = flops_per_token * batch_size * sequence_length
-
-        # Bytes transferred (model weights + activations)
-        precision_bytes = {
-            "fp32": 4,
-            "fp16": 2,
-            "bf16": 2,
-            "fp8": 1,
-            "int8": 1,
-            "int4": 0.5,
-        }
-        bytes_per_param = precision_bytes[precision]
-
-        # Model parameters loaded from memory
-        param_bytes = model.total_params() * bytes_per_param
-
-        # Activation memory (approximate, depends on batch size)
-        # Activations: batch × seq × hidden_size per layer
-        activation_bytes = (
-            batch_size * sequence_length * model.hidden_size * bytes_per_param * 2
-        )  # Factor of 2 for intermediate activations
-
-        total_bytes = param_bytes + activation_bytes
-
-        # Arithmetic intensity
-        arithmetic_intensity = total_flops / total_bytes
-
-        return arithmetic_intensity
-
-    def get_hardware_balance_point(self, hardware: HardwareSpec) -> float:
-        """
-        Calculate hardware's arithmetic intensity balance point.
-
-        Balance point = Peak TFLOPS / Peak Bandwidth (GB/s)
-
-        Workloads with AI above this are compute-bound.
-        Workloads with AI below this are memory-bound.
-
-        Args:
-            hardware: Hardware specifications
-
-        Returns:
-            Balance point (FLOPs/byte)
-        """
-        # Convert TFLOPS to FLOPS and GB/s to bytes/s
-        peak_flops = hardware.peak_tflops * 1e12
-        peak_bandwidth_bytes_per_sec = hardware.hbm_bandwidth_gb_s * 1e9
-
-        balance_point = peak_flops / peak_bandwidth_bytes_per_sec
-
-        return balance_point
+    # ---------- Prefill ----------
 
     def predict_prefill_latency(
         self,
@@ -227,159 +225,122 @@ class RooflineAnalyzer:
         input_length: int,
         precision: PrecisionType = "fp16",
     ) -> tuple[float, float, bool]:
-        """
-        Predict prefill (prompt processing) latency.
+        """Return (latency_ms, achieved_tflops, is_compute_bound)."""
+        bpe = bytes_per_element(precision)
+        total_flops = (
+            self.calculate_flops_per_token(model, input_length) * batch_size * input_length
+        )
 
-        Prefill is usually compute-bound for larger batches and sequences.
-
-        Args:
-            model: Model configuration
-            hardware: Hardware specifications
-            batch_size: Number of sequences
-            input_length: Input prompt length (tokens)
-            precision: Numerical precision
-
-        Returns:
-            Tuple of (latency_ms, achieved_tflops, is_compute_bound)
-        """
-        # Calculate FLOPs for prefill
-        flops_per_token = self.calculate_flops_per_token(model)
-        total_flops = flops_per_token * batch_size * input_length
-
-        # Calculate arithmetic intensity
-        ai = self.calculate_arithmetic_intensity(
+        ai = self.calculate_arithmetic_intensity_prefill(
             model, batch_size, input_length, precision
         )
-        balance_point = self.get_hardware_balance_point(hardware)
+        ridge = self.get_hardware_balance_point(hardware, precision)
+        is_compute_bound = ai > ridge
 
-        is_compute_bound = ai > balance_point
+        compute_time = total_flops / (
+            hardware.peak_tflops_for(precision) * 1e12 * self._config.compute_efficiency
+        )
 
-        if is_compute_bound:
-            # Compute-bound: limited by TFLOPS
-            effective_tflops = hardware.peak_tflops * self.compute_efficiency
-            latency_sec = total_flops / (effective_tflops * 1e12)
-        else:
-            # Memory-bound: limited by bandwidth
-            precision_bytes = {
-                "fp32": 4,
-                "fp16": 2,
-                "bf16": 2,
-                "fp8": 1,
-                "int8": 1,
-                "int4": 0.5,
-            }
-            bytes_per_param = precision_bytes[precision]
-            param_bytes = model.total_params() * bytes_per_param
+        # Memory-bound time: reading weights once + writing KV (~proportional
+        # to batch·seq). KV write is a small fraction of weight read except
+        # for tiny models, but include it for correctness.
+        param_bytes = model.total_params() * bpe
+        kv_written = (
+            model.kv_cache_bytes_per_token(precision) * batch_size * input_length
+        )
+        bw_time = (param_bytes + kv_written) / (
+            hardware.memory_bandwidth_gb_s * 1e9 * self._config.memory_efficiency
+        )
 
-            effective_bandwidth = (
-                hardware.hbm_bandwidth_gb_s * 1e9 * self.memory_efficiency
-            )
-            latency_sec = param_bytes / effective_bandwidth
+        # Actual wallclock is the max (the other resource is idle waiting).
+        latency_sec = max(compute_time, bw_time)
+        latency_sec += self._allreduce_time(
+            hardware, model, batch_size, input_length, precision
+        )
 
-        # Add communication overhead (tensor parallelism)
-        if hardware.tensor_parallel_size > 1:
-            comm_overhead_sec = (
-                model.num_layers
-                * self.COMMUNICATION_LATENCY_US
-                * 1e-6
-                * hardware.tensor_parallel_size
-            )
-            latency_sec += comm_overhead_sec
+        achieved_tflops = (total_flops / latency_sec) / 1e12 if latency_sec > 0 else 0.0
+        return latency_sec * 1000.0, achieved_tflops, is_compute_bound
 
-        # Calculate achieved TFLOPS
-        achieved_tflops = (total_flops / latency_sec) / 1e12 if latency_sec > 0 else 0
-
-        latency_ms = latency_sec * 1000
-
-        return latency_ms, achieved_tflops, is_compute_bound
+    # ---------- Decode ----------
 
     def predict_decode_latency(
         self,
         model: ModelConfig,
         hardware: HardwareSpec,
         batch_size: int,
+        sequence_length: int,
         precision: PrecisionType = "fp16",
     ) -> tuple[float, float, bool]:
+        """Return (per-token latency_ms, achieved_tflops, is_memory_bound).
+
+        ``sequence_length`` is the current context length at this decode step
+        (i.e., input_length + number_of_tokens_already_generated). Callers
+        that want an average across an output run should integrate across
+        ``range(input_length, input_length + output_length)``.
         """
-        Predict decode (token generation) latency per token.
+        bpe = bytes_per_element(precision)
 
-        Decode is usually memory-bound (loading weights for single token).
+        flops_per_step = self.calculate_flops_per_token(model, sequence_length) * batch_size
 
-        Args:
-            model: Model configuration
-            hardware: Hardware specifications
-            batch_size: Number of sequences
-            precision: Numerical precision
+        param_bytes = model.total_params() * bpe
+        # **Bug-fix anchor**: reads the FULL growing KV cache, not one token's worth.
+        kv_bytes = model.kv_cache_bytes_per_token(precision) * batch_size * sequence_length
+        total_bytes = param_bytes + kv_bytes
 
-        Returns:
-            Tuple of (latency_ms_per_token, achieved_tflops, is_memory_bound)
-        """
-        # Decode processes one token at a time (autoregressive)
-        flops_per_token = self.calculate_flops_per_token(model)
-        total_flops = flops_per_token * batch_size
+        bw_time = total_bytes / (
+            hardware.memory_bandwidth_gb_s * 1e9 * self._config.memory_efficiency
+        )
+        # Decode is essentially always memory-bound in modern LLMs — only
+        # cross the ridge with enormous batches.
+        latency_sec = bw_time
+        latency_sec += self._allreduce_time(
+            hardware, model, batch_size, sequence_length=1, precision=precision
+        )
 
-        # Decode is typically memory-bound (loading model weights)
-        precision_bytes = {
-            "fp32": 4,
-            "fp16": 2,
-            "bf16": 2,
-            "fp8": 1,
-            "int8": 1,
-            "int4": 0.5,
-        }
-        bytes_per_param = precision_bytes[precision]
+        achieved_tflops = (flops_per_step / latency_sec) / 1e12 if latency_sec > 0 else 0.0
+        return latency_sec * 1000.0, achieved_tflops, True
 
-        # Model parameters + KV cache reads
-        param_bytes = model.total_params() * bytes_per_param
+    # ---------- AllReduce (ring) ----------
 
-        # KV cache bytes per token (2 for K and V)
-        kv_bytes_per_token = model.kv_cache_bytes_per_token(precision)
-
-        total_bytes = param_bytes + (kv_bytes_per_token * batch_size)
-
-        # Decode is memory-bound for typical batch sizes
-        effective_bandwidth = hardware.hbm_bandwidth_gb_s * 1e9 * self.memory_efficiency
-        latency_sec = total_bytes / effective_bandwidth
-
-        # Add communication overhead
-        if hardware.tensor_parallel_size > 1:
-            comm_overhead_sec = (
-                model.num_layers
-                * self.COMMUNICATION_LATENCY_US
-                * 1e-6
-                * hardware.tensor_parallel_size
-            )
-            latency_sec += comm_overhead_sec
-
-        # Calculate achieved TFLOPS
-        achieved_tflops = (total_flops / latency_sec) / 1e12 if latency_sec > 0 else 0
-
-        latency_ms = latency_sec * 1000
-
-        is_memory_bound = True  # Decode is almost always memory-bound
-
-        return latency_ms, achieved_tflops, is_memory_bound
-
-    def calculate_mfu(
-        self, achieved_tflops: float, hardware: HardwareSpec
+    def _allreduce_time(
+        self,
+        hardware: HardwareSpec,
+        model: ModelConfig,
+        batch_size: int,
+        sequence_length: int,
+        precision: PrecisionType,
     ) -> float:
+        """Total AllReduce time per layer-group, summed across all layers.
+
+        Ring-AllReduce: ``T ≈ 2·(N-1)/N · M/B  +  2·(N-1)·α``, with two such
+        operations per transformer layer (post-attention, post-MLP).
+        Returns zero for TP=1.
         """
-        Calculate Model FLOPS Utilization (MFU).
-
-        MFU = achieved_tflops / peak_tflops
-
-        Args:
-            achieved_tflops: Measured TFLOPS
-            hardware: Hardware specifications
-
-        Returns:
-            MFU (0.0-1.0)
-        """
-        if hardware.peak_tflops == 0:
+        tp = hardware.tensor_parallel_size
+        if tp <= 1 or self._config.allreduce_per_layer == 0:
             return 0.0
 
-        mfu = achieved_tflops / hardware.peak_tflops
-        return min(mfu, 1.0)  # Cap at 100%
+        bpe = bytes_per_element(precision)
+        # Message size = full hidden-state tensor replicated per node before
+        # reduction = batch · seq · d · bpe bytes.
+        message_bytes = batch_size * sequence_length * model.hidden_size * bpe
+        bw = hardware.interconnect_bandwidth_gb_s * 1e9
+        alpha = hardware.interconnect_latency_us * 1e-6
+
+        per_allreduce = 2 * (tp - 1) / tp * message_bytes / bw + 2 * (tp - 1) * alpha
+        total = per_allreduce * self._config.allreduce_per_layer * model.num_layers
+        return total
+
+    # ---------- Utilization ----------
+
+    def calculate_mfu(
+        self, achieved_tflops: float, hardware: HardwareSpec, precision: PrecisionType = "fp16"
+    ) -> float:
+        """MFU against the precision-matched peak."""
+        peak = hardware.peak_tflops_for(precision)
+        if peak == 0:
+            return 0.0
+        return min(1.0, achieved_tflops / peak)
 
     def calculate_mbu(
         self,
@@ -388,47 +349,25 @@ class RooflineAnalyzer:
         batch_size: int,
         latency_sec: float,
         precision: PrecisionType = "fp16",
+        sequence_length: int = 1,
     ) -> float:
+        """MBU = achieved memory bandwidth / peak bandwidth.
+
+        ``sequence_length`` should reflect the context read during the step
+        being measured (decode: current position; prefill: input length).
         """
-        Calculate Model Bandwidth Utilization (MBU).
-
-        MBU = achieved_bandwidth / peak_bandwidth
-        where achieved_bandwidth = total_bytes / latency
-
-        Args:
-            model: Model configuration
-            hardware: Hardware specifications
-            batch_size: Number of sequences
-            latency_sec: Measured latency (seconds)
-            precision: Numerical precision
-
-        Returns:
-            MBU (0.0-1.0)
-        """
-        if latency_sec == 0 or hardware.hbm_bandwidth_gb_s == 0:
+        if latency_sec <= 0 or hardware.memory_bandwidth_gb_s <= 0:
             return 0.0
 
-        # Total bytes transferred (params + KV cache)
-        precision_bytes = {
-            "fp32": 4,
-            "fp16": 2,
-            "bf16": 2,
-            "fp8": 1,
-            "int8": 1,
-            "int4": 0.5,
-        }
-        bytes_per_param = precision_bytes[precision]
-        param_bytes = model.total_params() * bytes_per_param
-        kv_bytes = model.kv_cache_bytes_per_token(precision) * batch_size
-
+        bpe = bytes_per_element(precision)
+        param_bytes = model.total_params() * bpe
+        kv_bytes = model.kv_cache_bytes_per_token(precision) * batch_size * sequence_length
         total_bytes = param_bytes + kv_bytes
 
-        # Achieved bandwidth
-        achieved_bandwidth_gb_s = (total_bytes / latency_sec) / 1e9
+        achieved_gb_s = (total_bytes / latency_sec) / 1e9
+        return min(1.0, achieved_gb_s / hardware.memory_bandwidth_gb_s)
 
-        # MBU
-        mbu = achieved_bandwidth_gb_s / hardware.hbm_bandwidth_gb_s
-        return min(mbu, 1.0)  # Cap at 100%
+    # ---------- End-to-end ----------
 
     def predict_latency(
         self,
@@ -439,33 +378,7 @@ class RooflineAnalyzer:
         output_length: int,
         precision: PrecisionType = "fp16",
     ) -> PerformanceMetrics:
-        """
-        Predict end-to-end inference latency and performance metrics.
-
-        Args:
-            model: Model configuration
-            hardware: Hardware specifications
-            batch_size: Number of sequences
-            input_length: Input prompt length (tokens)
-            output_length: Output generation length (tokens)
-            precision: Numerical precision
-
-        Returns:
-            PerformanceMetrics with detailed predictions
-
-        Example:
-            >>> metrics = analyzer.predict_latency(
-            ...     model=llama3_8b,
-            ...     hardware=rtx_5090,
-            ...     batch_size=32,
-            ...     input_length=2048,
-            ...     output_length=512,
-            ...     precision="fp16"
-            ... )
-            >>> print(f"Total latency: {metrics.total_latency_ms:.0f}ms")
-            >>> print(f"Throughput: {metrics.throughput_tokens_per_sec:.0f} tok/s")
-        """
-        # Validate inputs
+        """End-to-end: prefill + total decode time."""
         if batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {batch_size}")
         if input_length <= 0:
@@ -473,50 +386,36 @@ class RooflineAnalyzer:
         if output_length < 0:
             raise ValueError(f"output_length must be non-negative, got {output_length}")
 
-        # Predict prefill latency
-        prefill_latency_ms, prefill_tflops, is_compute_bound = (
-            self.predict_prefill_latency(
-                model, hardware, batch_size, input_length, precision
-            )
+        prefill_ms, prefill_tflops, is_compute_bound = self.predict_prefill_latency(
+            model, hardware, batch_size, input_length, precision
         )
 
-        # Predict decode latency (per token)
-        decode_latency_per_token_ms, decode_tflops, is_memory_bound = (
-            self.predict_decode_latency(model, hardware, batch_size, precision)
+        # Decode cost grows as KV cache grows. Integrate step-by-step, but
+        # the cost is linear in seq_len so the average is taken at
+        # ``input_length + output_length/2``.
+        avg_seq_during_decode = input_length + max(0, output_length // 2)
+        per_token_ms, decode_tflops, is_memory_bound = self.predict_decode_latency(
+            model, hardware, batch_size, avg_seq_during_decode, precision
         )
+        decode_ms = per_token_ms * output_length
+        total_ms = prefill_ms + decode_ms
 
-        # Total decode latency
-        decode_latency_ms = decode_latency_per_token_ms * output_length
-
-        # Total latency
-        total_latency_ms = prefill_latency_ms + decode_latency_ms
-
-        # Calculate MFU (use prefill TFLOPS as it's typically higher)
-        mfu = self.calculate_mfu(prefill_tflops, hardware)
-
-        # Calculate MBU (use decode as it's memory-bound)
+        mfu = self.calculate_mfu(prefill_tflops, hardware, precision)
         mbu = self.calculate_mbu(
-            model,
-            hardware,
-            batch_size,
-            decode_latency_per_token_ms / 1000,  # Convert to seconds
-            precision,
+            model, hardware, batch_size, per_token_ms / 1000.0, precision, avg_seq_during_decode
         )
 
-        # Calculate throughput (tokens/second)
         total_tokens = batch_size * (input_length + output_length)
-        total_latency_sec = total_latency_ms / 1000
-        throughput = total_tokens / total_latency_sec if total_latency_sec > 0 else 0
+        throughput = total_tokens / (total_ms / 1000.0) if total_ms > 0 else 0.0
 
-        # Arithmetic intensity
-        ai = self.calculate_arithmetic_intensity(
+        ai = self.calculate_arithmetic_intensity_prefill(
             model, batch_size, input_length, precision
         )
 
         return PerformanceMetrics(
-            prefill_latency_ms=prefill_latency_ms,
-            decode_latency_ms=decode_latency_ms,
-            total_latency_ms=total_latency_ms,
+            prefill_latency_ms=prefill_ms,
+            decode_latency_ms=decode_ms,
+            total_latency_ms=total_ms,
             prefill_tflops=prefill_tflops,
             decode_tflops=decode_tflops,
             mfu=mfu,
@@ -536,23 +435,6 @@ class RooflineAnalyzer:
         output_length: int,
         precision: PrecisionType = "fp16",
     ) -> float:
-        """
-        Predict throughput (tokens/second).
-
-        Convenience method that wraps predict_latency().
-
-        Args:
-            model: Model configuration
-            hardware: Hardware specifications
-            batch_size: Number of sequences
-            input_length: Input prompt length
-            output_length: Output generation length
-            precision: Numerical precision
-
-        Returns:
-            Throughput in tokens/second
-        """
-        metrics = self.predict_latency(
+        return self.predict_latency(
             model, hardware, batch_size, input_length, output_length, precision
-        )
-        return metrics.throughput_tokens_per_sec
+        ).throughput_tokens_per_sec

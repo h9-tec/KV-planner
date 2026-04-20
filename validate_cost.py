@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Validation script for CostAnalyzer."""
 
+import pathlib
 import sys
-sys.path.insert(0, "/home/hesham-haroun/kv-planner/src")
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent / "src"))
 
 from kv_planner.core.cost import CostAnalyzer
 from kv_planner.domain import ModelConfig

@@ -13,9 +13,9 @@ from kv_planner.domain import (
 
 @pytest.fixture
 def llama3_8b() -> ModelConfig:
-    """Llama 3 8B model configuration."""
+    """Llama 3 8B — matches https://huggingface.co/meta-llama/Meta-Llama-3-8B config."""
     return ModelConfig(
-        name="meta-llama/Llama-3-8b-hf",
+        name="meta-llama/Meta-Llama-3-8B",
         num_layers=32,
         hidden_size=4096,
         num_attention_heads=32,
@@ -24,14 +24,16 @@ def llama3_8b() -> ModelConfig:
         vocab_size=128256,
         max_position_embeddings=8192,
         attention_type="GQA",
+        ffn_type="swiglu",
+        ffn_intermediate_size=14336,
     )
 
 
 @pytest.fixture
 def llama3_70b() -> ModelConfig:
-    """Llama 3 70B model configuration."""
+    """Llama 3 70B — matches https://huggingface.co/meta-llama/Meta-Llama-3-70B config."""
     return ModelConfig(
-        name="meta-llama/Llama-3-70b-hf",
+        name="meta-llama/Meta-Llama-3-70B",
         num_layers=80,
         hidden_size=8192,
         num_attention_heads=64,
@@ -40,6 +42,8 @@ def llama3_70b() -> ModelConfig:
         vocab_size=128256,
         max_position_embeddings=8192,
         attention_type="GQA",
+        ffn_type="swiglu",
+        ffn_intermediate_size=28672,
     )
 
 
@@ -51,7 +55,7 @@ def h100_single() -> HardwareSpec:
         num_gpus=1,
         gpu_memory_gb=80.0,
         peak_tflops=989.0,  # FP16
-        hbm_bandwidth_gb_s=3350.0,  # ~3.35 TB/s
+        memory_bandwidth_gb_s=3350.0,  # ~3.35 TB/s
         l2_cache_mb=60.0,
     )
 
@@ -64,7 +68,7 @@ def h100_4x() -> HardwareSpec:
         num_gpus=4,
         gpu_memory_gb=80.0,
         peak_tflops=989.0,
-        hbm_bandwidth_gb_s=3350.0,
+        memory_bandwidth_gb_s=3350.0,
         tensor_parallel_size=4,
         interconnect_type="NVLink",
         interconnect_bandwidth_gb_s=900.0,
@@ -79,7 +83,7 @@ def a100_single() -> HardwareSpec:
         num_gpus=1,
         gpu_memory_gb=80.0,
         peak_tflops=312.0,  # FP16
-        hbm_bandwidth_gb_s=2039.0,  # ~2 TB/s
+        memory_bandwidth_gb_s=2039.0,  # ~2 TB/s
         l2_cache_mb=40.0,
     )
 

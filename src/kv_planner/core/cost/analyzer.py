@@ -82,39 +82,65 @@ class CostAnalyzer:
         roofline_analyzer: Performance analyzer for throughput calculations
     """
 
-    # Market average GPU pricing (2025, on-demand, USD/hour)
+    # Market average GPU pricing (2025, on-demand, USD/hour per GPU).
+    # Sources: AWS, Azure, GCP, Lambda Labs, RunPod, Vast.ai listings. These
+    # are point-in-time figures; override via `set_pricing()` or the constructor.
     DEFAULT_PRICING = {
-        # Datacenter GPUs
-        "H100-80GB": 4.50,   # Mid-range (AWS ~$3.90, Azure ~$6.98)
-        "H100-96GB": 5.00,   # HBM3e variant
-        "A100-40GB": 2.00,   # AWS ~$1.50-3.67
-        "A100-80GB": 2.50,
-        "MI300X": 5.50,      # AMD flagship
-        "GB200": 10.00,      # Estimated (not yet available)
+        # Hopper
+        "H100-SXM-80GB": 4.50,          # AWS ~$3.90, Azure ~$6.98, GCP ~$4.99
+        "H100-PCIe-80GB": 3.00,
+        "H100-NVL-94GB": 5.00,
+        "H200-SXM-141GB": 6.00,
 
-        # RTX 50 series (Blackwell)
-        "RTX-5090": 0.35,    # $0.27-0.47/hr
-        "RTX-5080": 0.25,    # Estimated
-        "RTX-5070-Ti": 0.20, # Estimated
-        "RTX-5070": 0.15,    # Estimated
+        # Blackwell datacenter
+        "B200-SXM-192GB": 8.00,          # early cloud listings
+        "GB200-Superchip": 12.00,        # NVL72 split across 72 GPUs
 
-        # RTX 40 series (Ada Lovelace)
-        "RTX-4090": 0.21,    # $0.18-0.23/hr
+        # Ampere datacenter
+        "A100-SXM-80GB": 2.50,
+        "A100-SXM-40GB": 1.80,
+        "A100-PCIe-80GB": 2.20,
+        "A10G": 1.20,
+
+        # Ada datacenter
+        "L40S": 1.50,
+        "L4": 0.80,
+
+        # Consumer RTX 50 (community clouds)
+        "RTX-5090": 0.35,
+        "RTX-5080": 0.25,
+        "RTX-5070-Ti": 0.20,
+        "RTX-5070": 0.15,
+        "RTX-5060-Laptop": 0.10,
+
+        # Consumer RTX 40
+        "RTX-4090": 0.21,
         "RTX-4080-Super": 0.18,
         "RTX-4080": 0.17,
         "RTX-4070-Ti-Super": 0.15,
         "RTX-4070-Ti": 0.14,
         "RTX-4070-Super": 0.13,
         "RTX-4070": 0.12,
+        "RTX-4060-Ti": 0.10,
+        "RTX-4060": 0.08,
 
-        # RTX 30 series (Ampere)
+        # Consumer RTX 30
         "RTX-3090-Ti": 0.13,
-        "RTX-3090": 0.12,    # $0.11-0.12/hr
+        "RTX-3090": 0.12,
         "RTX-3080-Ti": 0.11,
+        "RTX-3080-12GB": 0.10,
         "RTX-3080": 0.10,
         "RTX-3070-Ti": 0.09,
         "RTX-3070": 0.08,
         "RTX-3060-Ti": 0.07,
+
+        # Volta
+        "V100-SXM-32GB": 1.00,
+
+        # AMD
+        "MI300X": 5.50,
+        "MI250X": 3.50,
+        "MI210": 2.00,
     }
 
     # Typical API pricing for comparison (USD per million tokens)

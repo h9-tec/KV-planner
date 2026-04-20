@@ -4,11 +4,11 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 from kv_planner.domain.exceptions import InvalidConfigurationError
+from kv_planner.domain.precision import PrecisionType, bytes_per_element
 
 
-# Type aliases for semantic clarity
-PrecisionType = Literal["fp32", "fp16", "bf16", "fp8", "int8", "int4"]
 AttentionType = Literal["MHA", "GQA", "MQA", "MLA"]
+FFNType = Literal["swiglu", "standard"]
 
 
 @dataclass(frozen=True)
@@ -52,6 +52,13 @@ class ModelConfig:
     attention_type: AttentionType = "GQA"
     sliding_window_size: Optional[int] = None
     attention_sink_tokens: int = 4
+
+    # FFN shape. Modern Llama/Mistral/Qwen use SwiGLU (3 matrices, intermediate
+    # size typically ~8/3·d so total FFN params ≈ 8·d²). GPT-2-era models use
+    # standard 2-matrix FFN (intermediate = 4·d, total ≈ 8·d²). Coefficient
+    # happens to be identical; the number of matmuls differs.
+    ffn_type: FFNType = "swiglu"
+    ffn_intermediate_size: Optional[int] = None  # if None, derived per ffn_type
 
     # MoE support
     is_moe: bool = False
@@ -151,28 +158,40 @@ class ModelConfig:
         """
         Calculate KV cache size per token in bytes.
 
-        Formula: 2 × num_layers × num_kv_heads × head_dim × precision_bytes
-        The factor of 2 accounts for both Key and Value matrices.
+        Formula::
+
+            2 · num_layers · num_key_value_heads · head_dim · bytes_per_element
+
+        The factor of 2 accounts for both K and V. GQA is handled naturally by
+        ``num_key_value_heads`` being smaller than ``num_attention_heads``.
+
+        Source: vLLM PagedAttention design doc
+        (https://docs.vllm.ai/en/latest/design/paged_attention/) — for Llama-3
+        8B in fp16 this returns exactly 131 072 bytes (128 KiB) per token.
 
         Args:
             precision: Precision type for KV cache
 
         Returns:
-            Bytes per token for KV cache
+            Bytes per token for KV cache (integer; may round down for int4)
         """
-        precision_bytes = {
-            "fp32": 4,
-            "fp16": 2,
-            "bf16": 2,
-            "fp8": 1,
-            "int8": 1,
-            "int4": 0.5,  # Theoretical 4 bits; actual storage often 8-bit padded
-        }
+        return int(
+            2
+            * self.num_layers
+            * self.num_key_value_heads
+            * self.head_dim
+            * bytes_per_element(precision)
+        )
 
-        bytes_per_element = precision_bytes[precision]
+    @property
+    def kv_hidden_size(self) -> int:
+        """Total K/V projection width = num_kv_heads · head_dim."""
+        return self.num_key_value_heads * self.head_dim
 
-        # 2× for K and V
-        return int(2 * self.num_layers * self.num_key_value_heads * self.head_dim * bytes_per_element)
+    @property
+    def ffn_num_matmuls(self) -> int:
+        """How many matmuls the FFN block performs per token (2 standard, 3 SwiGLU)."""
+        return 3 if self.ffn_type == "swiglu" else 2
 
     def supports_precision(self, precision: PrecisionType) -> bool:
         """Check if model supports the given precision for KV cache."""
@@ -200,35 +219,71 @@ class ModelConfig:
             f"attention={attention_info})"
         )
 
+    @property
+    def _ffn_intermediate(self) -> int:
+        """FFN intermediate dimension (d_ff), honouring ``ffn_intermediate_size``.
+
+        Default for SwiGLU is (8/3)·d rounded up to a multiple of 256 (Llama
+        convention); default for standard FFN is 4·d. Override with
+        ``ffn_intermediate_size`` in :class:`ModelConfig` for exact param counts.
+        """
+        if self.ffn_intermediate_size is not None:
+            return self.ffn_intermediate_size
+        if self.ffn_type == "swiglu":
+            return int(round(self.hidden_size * 8 / 3 / 256) * 256)
+        return 4 * self.hidden_size
+
     def total_params(self) -> int:
         """
-        Estimate total model parameters.
+        Estimate total model parameters — GQA-aware.
 
-        Approximate calculation for transformer models:
-        - Attention: num_layers × 4 × hidden² (Q, K, V, O projections)
-        - MLP: num_layers × 8 × hidden² (up, down, gate for  SwiGLU)
-        - Embeddings: vocab_size × hidden
-        - Layer norms: negligible
+        Breakdown per layer (decoder-only transformer):
 
-        Returns:
-            Estimated total parameters (integer)
+        * Attention
+          * Q projection: ``d · d`` parameters
+          * K, V projections (GQA): ``d · (num_kv_heads · head_dim)`` each
+          * Output projection: ``d · d`` parameters
+        * FFN
+          * SwiGLU (3 matmuls, gate + up + down): ``3 · d · d_ff``
+          * Standard (2 matmuls, up + down): ``2 · d · d_ff``
+        * Layer-norms: negligible — excluded.
+
+        Plus:
+
+        * Token embedding: ``vocab_size · d``
+        * LM head: ``vocab_size · d`` (we assume untied — Llama-3 does not tie)
+
+        Reference: kipply, "Transformer Inference Arithmetic" and
+        EleutherAI cookbook ``calc_transformer_params.py``
+        (https://github.com/EleutherAI/cookbook).
         """
         hidden = self.hidden_size
         layers = self.num_layers
         vocab = self.vocab_size
+        kv_hidden = self.num_key_value_heads * self.head_dim
 
-        # Attention parameters (Q, K, V, O projections)
-        attn_params = layers * 4 * hidden * hidden
+        q_and_o = 2 * hidden * hidden
+        kv = 2 * hidden * kv_hidden
+        attn_params_per_layer = q_and_o + kv
 
-        # MLP parameters (up, down, gate for SwiGLU/FFN)
-        # Standard transformer: 4 × hidden intermediate size
-        # Total: up_proj + down_proj + gate_proj ≈ 8 × hidden²
-        mlp_params = layers * 8 * hidden * hidden
+        d_ff = self._ffn_intermediate
+        if self.ffn_type == "swiglu":
+            ffn_params_per_layer = 3 * hidden * d_ff
+        else:
+            ffn_params_per_layer = 2 * hidden * d_ff
 
-        # Embedding parameters
-        embed_params = vocab * hidden
+        per_layer = attn_params_per_layer + ffn_params_per_layer
 
-        # Total
-        total = attn_params + mlp_params + embed_params
+        # MoE: only active experts contribute at inference time for FLOPs, but
+        # ALL experts sit in memory. total_params reports stored params, so
+        # multiply FFN portion by num_experts.
+        if self.is_moe and self.num_experts is not None:
+            per_layer = attn_params_per_layer + ffn_params_per_layer * self.num_experts
 
-        return total
+        dense = layers * per_layer
+
+        # Untied embeddings: in + out. Set to single vocab·hidden if
+        # you model a tied-embedding variant.
+        embed_params = 2 * vocab * hidden
+
+        return dense + embed_params
