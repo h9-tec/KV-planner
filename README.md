@@ -10,13 +10,15 @@ principles, with a formula and a citation for every number.
 [![version 0.3.0](https://img.shields.io/badge/version-0.3.0-fa9450.svg)](CHANGELOG.md)
 [![status: Research Preview](https://img.shields.io/badge/status-Research%20Preview-eb6e88.svg)](#honest-limitations)
 
-> **Status: Research Preview.** The physics engine is sound and tests well
-> against published literature. End-to-end predictions have so far been
-> validated on a single laptop GPU (RTX 5060 Laptop) running Ollama —
-> enterprise GPU validation (H100, A100, MI300X) is on the roadmap but not
-> done yet. See [`BENCHMARKS.md`](BENCHMARKS.md) for the honest validation
-> ledger and [Honest limitations](#honest-limitations) below before sizing
-> a production cluster based solely on kv-planner's output.
+> **Status: Research Preview.** Physics engine validated end-to-end on
+> **4 GPUs** so far — RTX 5060 Laptop (Ollama) and H100-SXM-80GB,
+> A100-PCIe-80GB, RTX-4090 (vLLM on RunPod). On enterprise GPUs the
+> default memory-efficiency assumption predicts per-token latency within
+> **2 %** MAPE; on consumer Ada (4090) MBU needs calibrating down to
+> ~0.59 (`kv-planner calibrate` does this automatically). L40S + MoE
+> campaigns pending. See [`BENCHMARKS.md`](BENCHMARKS.md) for the full
+> validation ledger and [Honest limitations](#honest-limitations) below
+> before sizing a production cluster based solely on kv-planner's output.
 
 ![kv-planner native GUI](docs/screenshots/gui-01-overview.png)
 
@@ -164,15 +166,16 @@ actually validated and what isn't:
   TFLOPS** traceable to a vendor whitepaper. No sparse-mode numbers
   sneaking in; no FP32-CUDA-reported-as-tensor-core.
 
-### What's unvalidated
+### What's validated (and what isn't)
 
-- **Single-GPU validation sample.** Real end-to-end measurements so
-  far cover exactly **one GPU** (RTX 5060 Laptop, 8 GB, Ollama
-  runtime). Llama-3 8B / DeepSeek-R1-Distill-7B / Aya-8B measured on
-  that one box. H100 / A100 / MI300X — the GPUs that matter for
-  production capacity planning — have **no real-measurement**
-  validation from us yet. Predictions for those GPUs are purely
-  theoretical roofline output.
+- **4-GPU validation sample.** End-to-end measurements now cover:
+  RTX 5060 Laptop (Ollama), RTX-4090, A100-PCIe-80GB, H100-SXM-80GB
+  (vLLM on RunPod). See [`BENCHMARKS.md`](BENCHMARKS.md) for the
+  full ledger. TPOT MAPE on enterprise GPUs is **< 2 %** at default
+  settings; consumer-Ada needs `kv-planner calibrate` to drop MBU
+  to ~0.59. L40S, MI300X, and all MoE models still have **zero
+  measured** validation — predictions for those are theoretical
+  roofline output only.
 - **Prefix-cache hit rate is an INPUT, not a prediction.** The
   `PrefixCachingAnalyzer` takes `hit_rate` as a parameter (the user
   provides it from their own workload trace). The included
@@ -207,17 +210,20 @@ actually validated and what isn't:
 
 ### Roadmap to un-research-preview
 
-- **0.3.1 — More validation.** Add published vLLM / SGLang / llm-d
-  benchmark points as regression fixtures for H100 TP1/TP8 and A100;
-  report delta between predicted and published per-(model, GPU) pair.
+- **0.3.1 — Published-benchmark regression fixtures.** Encode
+  vLLM / SGLang / llm-d public benchmark points as pytest fixtures so
+  each (model, GPU) pair has a measured-vs-predicted check that CI
+  enforces.
 - **0.4.0 — Architecture consolidation.** Merge the three upper
   layers; aim for ~30 % LOC reduction, same public API.
 - **0.4.0 — Workload trace analyzer.** Parse real request logs
   (OpenAI JSONL, vLLM metrics) to compute empirical prefix-cache hit
   rates; drop the "upper bound estimate" caveat.
-- **0.5.0 — Enterprise validation partners.** Run end-to-end
-  measurement on H100 / A100 / MI300X via cloud GPU rentals; publish
-  predicted-vs-measured tables.
+- **0.5.0 — Expanded enterprise validation.** Extend the RunPod
+  campaign with MI300X, GH200, B200, and MoE models (Mixtral-8x7B,
+  Qwen3-30B-A3B) once those SKUs are on-demand. L40S retry with a
+  forced `cloudType=SECURE` to work around the community-cloud
+  public-IP allocation issue that blocked the first attempt.
 
 ## Install
 
@@ -996,6 +1002,8 @@ sidebar slider updates every chart in < 100 ms.
 
 ## Real-hardware validation
 
+### Laptop / Ollama (author's machine)
+
 Every screenshot and every CLI example in this README comes from
 actual output captured on the author's machine:
 **Intel i7-14700HX, 31 GB RAM, RTX 5060 Laptop (8 GB VRAM), Ollama with
@@ -1027,6 +1035,28 @@ Ollama traffic:
   calibrated MBU            0.368  (default 0.75 is vLLM-tuned;
                                     Ollama/llama.cpp typically 0.30–0.45)
 ```
+
+### Enterprise GPUs / vLLM (rented RunPod pods)
+
+The harness in [`scripts/validation/`](scripts/validation/) runs
+kv-planner predictions against live vLLM servers on rented GPUs,
+then compares each prediction to the measured TPOT / throughput /
+TTFT. First campaign was run on **Qwen2.5-7B-Instruct fp16,
+input=2048 output=256 concurrency=8**, and cost $2.25 total:
+
+| GPU | Predicted TPOT | Measured TPOT (p50) | **MAPE TPOT** |
+|---|---:|---:|---:|
+| H100-SXM-80GB | 6.1 ms | 6.0 ms | **1.9 %** |
+| A100-PCIe-80GB | 10.6 ms | 10.6 ms | **0.6 %** |
+| RTX-4090 (community) | 20.3 ms | 15.9 ms | **28.1 %** |
+
+**On enterprise GPUs, default MBU=0.75 predicts per-token latency
+within 2 %.** On consumer Ada (4090) the realised MBU is ~0.59 —
+`kv-planner calibrate` derives that automatically. Per-config JSONs
+live under `docs/validation_results/`; see
+[`BENCHMARKS.md`](BENCHMARKS.md) for the full honest ledger including
+throughput MAPE, reproducibility details, and what's still
+unvalidated (L40S, MI300X, MoE models).
 
 ## Development
 
