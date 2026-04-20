@@ -159,6 +159,9 @@ EOF
 # ------- Step 5: Loadtest + calibrate --------------------------------------
 log "Step 5/6: running loadtest ($CONCURRENCY concurrent × $NUM_REQUESTS requests)"
 LOADTEST_JSON="$WORK_DIR/loadtest.json"
+LOADTEST_ERR="$WORK_DIR/loadtest.err"
+# Keep stdout (the --json blob) and stderr separate so stray log lines don't
+# corrupt the JSON file. If loadtest exits nonzero, fail loud with both files.
 python3 -m kv_planner.cli.main loadtest \
     --endpoint "http://127.0.0.1:$VLLM_PORT" \
     --model "$MODEL_HF" \
@@ -167,9 +170,17 @@ python3 -m kv_planner.cli.main loadtest \
     --num-requests "$NUM_REQUESTS" \
     --num-predict "$OUTPUT_LEN" \
     --prompt "Write a detailed technical explanation of how attention mechanisms work in transformer models, covering scaled dot-product attention, queries, keys, values, multi-head attention, and grouped-query attention." \
-    --json > "$LOADTEST_JSON" 2>&1
+    --json > "$LOADTEST_JSON" 2> "$LOADTEST_ERR" || {
+        log "loadtest exited nonzero; stderr dump:"
+        cat "$LOADTEST_ERR"
+        log "loadtest stdout (first 40 lines):"
+        head -40 "$LOADTEST_JSON" || true
+    }
+log "loadtest stdout size=$(wc -c <"$LOADTEST_JSON") bytes, first 2 lines:"
+head -2 "$LOADTEST_JSON" || true
 
 CALIBRATE_JSON="$WORK_DIR/calibrate.json"
+CALIBRATE_ERR="$WORK_DIR/calibrate.err"
 python3 -m kv_planner.cli.main calibrate \
     --endpoint "http://127.0.0.1:$VLLM_PORT" \
     --model "$MODEL_SLUG" \
@@ -178,23 +189,38 @@ python3 -m kv_planner.cli.main calibrate \
     --concurrency 2 \
     --num-requests 8 \
     --num-predict 128 \
-    --json > "$CALIBRATE_JSON" 2>&1 || true
+    --json > "$CALIBRATE_JSON" 2> "$CALIBRATE_ERR" || true
 
 # ------- Step 6: Single JSON artifact ---------------------------------------
 log "Step 6/6: writing validation_result.json"
 python3 - <<EOF > "$WORK_DIR/validation_result.json"
-import json
+import json, pathlib
 
-prediction = json.loads(open("$PREDICTION_JSON").read()) if open("$PREDICTION_JSON").read().strip().startswith("{") else {}
-roofline = json.loads(open("$WORK_DIR/roofline_raw.json").read())
-loadtest = json.loads(open("$LOADTEST_JSON").read())
-try:
-    calibrate = json.loads(open("$CALIBRATE_JSON").read())
-except Exception:
-    calibrate = {}
+def _load_or(path, default):
+    p = pathlib.Path(path)
+    if not p.exists():
+        return default
+    txt = p.read_text().strip()
+    if not txt or not txt.startswith(("{", "[")):
+        return default
+    try:
+        return json.loads(txt)
+    except json.JSONDecodeError:
+        return default
 
-measured_tpot_ms = loadtest.get("tpot_ms", {}).get("p50", 0.0)
-predicted_tpot_ms = roofline["tpot_ms"]
+prediction = _load_or("$PREDICTION_JSON", {})
+roofline = _load_or("$WORK_DIR/roofline_raw.json", {})
+loadtest = _load_or("$LOADTEST_JSON", {})
+calibrate = _load_or("$CALIBRATE_JSON", {})
+
+def _safe_percentile(d, metric, pct="p50", default=0.0):
+    v = d.get(metric)
+    if isinstance(v, dict):
+        return v.get(pct) or default
+    return default
+
+measured_tpot_ms = _safe_percentile(loadtest, "tpot_ms", "p50", 0.0)
+predicted_tpot_ms = roofline.get("tpot_ms", 0.0)
 
 # MAPE on TPOT (best decode metric)
 if measured_tpot_ms > 0 and predicted_tpot_ms > 0:
@@ -203,8 +229,8 @@ else:
     mape_tpot = None
 
 # MAPE on aggregate throughput
-measured_tps = loadtest.get("aggregate_tok_s", 0)
-predicted_tps = roofline["throughput_tok_s"]
+measured_tps = loadtest.get("aggregate_tok_s", 0) or 0
+predicted_tps = roofline.get("throughput_tok_s", 0.0)
 if measured_tps > 0 and predicted_tps > 0:
     mape_tps = abs(predicted_tps - measured_tps) / measured_tps * 100
 else:
@@ -225,13 +251,14 @@ print(json.dumps({
     "predicted": roofline,
     "measured": {
         "aggregate_tok_s": measured_tps,
-        "ttft_ms_p50": loadtest.get("ttft_ms", {}).get("p50"),
-        "ttft_ms_p99": loadtest.get("ttft_ms", {}).get("p99"),
+        "ttft_ms_p50": _safe_percentile(loadtest, "ttft_ms", "p50", None),
+        "ttft_ms_p99": _safe_percentile(loadtest, "ttft_ms", "p99", None),
         "tpot_ms_p50": measured_tpot_ms,
-        "tpot_ms_p99": loadtest.get("tpot_ms", {}).get("p99"),
-        "e2e_ms_p50": loadtest.get("e2e_ms", {}).get("p50"),
-        "e2e_ms_p99": loadtest.get("e2e_ms", {}).get("p99"),
+        "tpot_ms_p99": _safe_percentile(loadtest, "tpot_ms", "p99", None),
+        "e2e_ms_p50": _safe_percentile(loadtest, "e2e_ms", "p50", None),
+        "e2e_ms_p99": _safe_percentile(loadtest, "e2e_ms", "p99", None),
         "errors": loadtest.get("errors", 0),
+        "raw_keys": sorted(loadtest.keys()) if loadtest else [],
     },
     "calibration": {
         "derived_mbu": calibrate.get("calibrated_mbu"),

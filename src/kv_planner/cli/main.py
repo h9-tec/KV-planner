@@ -1669,11 +1669,12 @@ def cmd_loadtest(args: argparse.Namespace) -> int:
         e2e_ms=args.e2e_slo_ms,
     )
 
-    print(
-        f"\n  loadtest {args.endpoint}  ·  {args.model}  ·  "
-        f"concurrency={args.concurrency}  requests={args.num_requests}  "
-        f"num_predict={args.num_predict}\n"
-    )
+    if not args.json:
+        print(
+            f"\n  loadtest {args.endpoint}  ·  {args.model}  ·  "
+            f"concurrency={args.concurrency}  requests={args.num_requests}  "
+            f"num_predict={args.num_predict}\n"
+        )
     lt = LoadTester()
 
     # Progress bar (carriage-return based)
@@ -1833,8 +1834,9 @@ def cmd_calibrate(args: argparse.Namespace) -> int:
         if entry.ollama_tags:
             ollama_tag = entry.ollama_tags[0]
 
-    print(f"\n  calibrate {entry.slug}  ·  {gpu_key}  "
-          f"({args.runtime if args.runtime != 'auto' else args.api})\n")
+    if not args.json:
+        print(f"\n  calibrate {entry.slug}  ·  {gpu_key}  "
+              f"({args.runtime if args.runtime != 'auto' else args.api})\n")
 
     lt = LoadTester()
     result = lt.run(
