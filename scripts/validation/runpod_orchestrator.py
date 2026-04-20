@@ -322,24 +322,31 @@ def run_one(
         if not ssh_ready:
             return RunResult(cfg, "failed", error="sshd never answered on assigned port")
 
-        # SSH + execute harness
+        # SSH + execute harness. Don't capture output — let it stream to
+        # the orchestrator's stdout so we can see each in-pod step live.
+        # The harness writes its own artifact to /workspace which we scp back.
         remote_cmd = (
             f"cd /workspace && "
-            f"git clone https://github.com/h9-tec/KV-planner.git repo && "
-            f"cd repo && "
+            f"(cd repo 2>/dev/null || git clone https://github.com/h9-tec/KV-planner.git repo) && "
+            f"cd repo && git pull --rebase --quiet 2>/dev/null || true && "
             f"export HF_TOKEN='{hf_token}' && "
-            f"bash scripts/validation/in_pod_validate.sh "
-            f"'{cfg.model_hf}' '{cfg.gpu_db_key}' '{cfg.model_slug}' '{cfg.precision}'"
+            f"bash -x scripts/validation/in_pod_validate.sh "
+            f"'{cfg.model_hf}' '{cfg.gpu_db_key}' '{cfg.model_slug}' '{cfg.precision}' 2>&1"
         )
         cmd = (
             f"ssh -p {ssh_port} {ssh_opts} "
             f"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "
+            f"-o ServerAliveInterval=30 -o ServerAliveCountMax=10 "
             f"root@{ssh_host} \"{remote_cmd}\""
         )
+        print(f"  [{cfg.gpu_db_key}] SSH: streaming in-pod output ↓↓↓")
+        # 40-minute timeout: covers pip install (5m) + model download (5m at
+        # slow HF mirror) + vLLM warmup (15m) + loadtest (5m) + scp (1m).
         result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True,
-            timeout=cfg.estimated_pod_minutes * 60 + 300,
+            cmd, shell=True, text=True,
+            timeout=cfg.estimated_pod_minutes * 60 + 1500,
         )
+        print(f"  [{cfg.gpu_db_key}] SSH exit code: {result.returncode}")
 
         # Pull back the JSON
         scp_cmd = (
