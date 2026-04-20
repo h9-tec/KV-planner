@@ -80,9 +80,9 @@ DEFAULT_MATRIX: list[Config] = [
            "meta-llama/Meta-Llama-3-8B-Instruct", "llama-3-8b",
            precision="fp16", estimated_hourly_usd=1.19),
 
-    # RTX 4090 — prosumer validation
+    # RTX 4090 — prosumer validation (use Qwen2.5-7B: non-gated, fits 24GB)
     Config("NVIDIA GeForce RTX 4090", "RTX-4090",
-           "meta-llama/Meta-Llama-3-8B-Instruct", "llama-3-8b",
+           "Qwen/Qwen2.5-7B-Instruct", "qwen2.5-7b",
            precision="fp16", estimated_hourly_usd=0.44),
 ]
 
@@ -390,8 +390,13 @@ def main() -> int:
     if args.include_moe:
         matrix += MOE_MATRIX
     if args.smoke:
-        # Just the cheapest config — smallest supply-constraint risk too.
-        matrix = [c for c in matrix if c.gpu_db_key == "RTX-4090"] or matrix[:1]
+        # Cheapest GPU + non-gated model so smoke doesn't depend on HF Meta
+        # gate access. Qwen2.5-7B is freely downloadable + well-tested on vLLM.
+        matrix = [c for c in matrix
+                  if c.gpu_db_key == "RTX-4090" and c.model_slug == "qwen2.5-7b"]
+        if not matrix:
+            matrix = [c for c in (DEFAULT_MATRIX + MOE_MATRIX)
+                      if c.model_slug == "qwen2.5-7b"][:1]
     print_matrix_summary(matrix)
 
     total_cost = sum(c.estimated_cost_usd for c in matrix)

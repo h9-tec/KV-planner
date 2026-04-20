@@ -42,8 +42,22 @@ log() { echo "[$(date +%T)] $*"; }
 # ------- Step 1: Install -----------------------------------------------------
 log "Step 1/6: ensuring Python + deps"
 which python3 >/dev/null || { echo "python3 missing"; exit 1; }
+python3 -c "import torch; print('base torch:', torch.__version__, 'CUDA:', torch.version.cuda)" || true
 python3 -m pip install --quiet --upgrade pip
-python3 -m pip install --quiet vllm
+
+# Upgrade torch alongside vllm so we don't end up with torch 2.4 + vllm 0.9
+# (vllm requires torch 2.5+). Pinning vllm to a version that's known-good on
+# the current CUDA/driver combo is safer than letting pip pick "latest".
+log "Step 1/6: installing vllm (this takes 5-8 min)"
+python3 -m pip install --quiet --upgrade vllm
+python3 -c "import vllm, torch; print('installed vllm:', vllm.__version__, '/ torch:', torch.__version__, '/ cuda avail:', torch.cuda.is_available())"
+
+# Prove HF_TOKEN propagation without leaking the value.
+if [ -n "${HF_TOKEN:-}" ]; then
+    log "HF_TOKEN is set (length=${#HF_TOKEN})"
+else
+    log "WARNING: HF_TOKEN is NOT set — gated models will 401"
+fi
 
 # kv-planner itself (already checked out before calling this script)
 if [ -d "$REPO_DIR/src/kv_planner" ]; then
@@ -77,9 +91,19 @@ for i in $(seq 1 90); do
         log "vLLM is up after ${i}0s"
         break
     fi
+    # Also fail fast if vLLM already crashed — no point waiting 15 min.
+    if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+        log "vLLM subprocess exited early. Full log below:"
+        echo "================= vllm.log (full) ================="
+        cat "$VLLM_LOG" || true
+        echo "================= end vllm.log ==================="
+        exit 1
+    fi
     if [ "$i" = "90" ]; then
-        log "vLLM failed to start. Last 20 log lines:"
-        tail -20 "$VLLM_LOG"
+        log "vLLM failed to start within 15 min. Full log below:"
+        echo "================= vllm.log (full) ================="
+        cat "$VLLM_LOG" || true
+        echo "================= end vllm.log ==================="
         exit 1
     fi
 done
