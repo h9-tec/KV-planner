@@ -144,7 +144,17 @@ def list_available_gpus(api_key: str) -> list[dict]:
     return _gql(query, {}, api_key).get("gpuTypes", [])
 
 
-def create_pod(api_key: str, gpu_type: str, image: str = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04") -> str:
+def create_pod(
+    api_key: str,
+    gpu_type: str,
+    image: str = "runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04",
+    cloud_type: str = "ALL",
+) -> str:
+    """Create a pod; try COMMUNITY first, then SECURE if supply-constrained.
+
+    ``cloud_type="ALL"`` means: try COMMUNITY, and if it fails with a
+    SUPPLY_CONSTRAINT error, fall back to SECURE automatically.
+    """
     query = """
     mutation CreatePod($input: PodFindAndDeployOnDemandInput!) {
       podFindAndDeployOnDemand(input: $input) {
@@ -154,22 +164,36 @@ def create_pod(api_key: str, gpu_type: str, image: str = "runpod/pytorch:2.4.0-p
       }
     }
     """
-    variables = {"input": {
-        "cloudType": "COMMUNITY",   # cheaper
-        "gpuCount": 1,
-        "volumeInGb": 60,
-        "containerDiskInGb": 30,
-        "minVcpuCount": 4,
-        "minMemoryInGb": 30,
-        "gpuTypeId": gpu_type,
-        "name": f"kvp-val-{int(time.time())}",
-        "imageName": image,
-        "dockerArgs": "",
-        "ports": "22/tcp,8000/http",
-        "volumeMountPath": "/workspace",
-    }}
-    pod = _gql(query, variables, api_key)["podFindAndDeployOnDemand"]
-    return pod["id"]
+    cloud_types_to_try = (
+        ["COMMUNITY", "SECURE"] if cloud_type == "ALL" else [cloud_type]
+    )
+    last_err: Exception | None = None
+    for ct in cloud_types_to_try:
+        variables = {"input": {
+            "cloudType": ct,
+            "gpuCount": 1,
+            "volumeInGb": 60,
+            "containerDiskInGb": 30,
+            "minVcpuCount": 4,
+            "minMemoryInGb": 30,
+            "gpuTypeId": gpu_type,
+            "name": f"kvp-val-{int(time.time())}",
+            "imageName": image,
+            "dockerArgs": "",
+            "ports": "22/tcp,8000/http",
+            "volumeMountPath": "/workspace",
+        }}
+        try:
+            pod = _gql(query, variables, api_key)["podFindAndDeployOnDemand"]
+            if pod and pod.get("id"):
+                return pod["id"]
+        except RuntimeError as e:
+            last_err = e
+            # Only fall through to next cloud type on supply / resource errors.
+            if "SUPPLY_CONSTRAINT" in str(e) or "resources to deploy" in str(e):
+                continue
+            raise
+    raise last_err or RuntimeError(f"create_pod failed for {gpu_type}")
 
 
 def get_pod(api_key: str, pod_id: str) -> dict:
@@ -231,22 +255,31 @@ def run_one(
     pod_id: Optional[str] = None
     try:
         pod_id = create_pod(api_key, cfg.gpu_runpod_id)
-        # Wait for running + port assigned
-        for i in range(60):
+        print(f"  pod_id={pod_id}, waiting for RUNNING + SSH port…")
+        # Wait up to 15 min for RUNNING + port (heavy images pull slowly)
+        pod = None
+        for i in range(90):
             time.sleep(10)
             pod = get_pod(api_key, pod_id)
-            if pod.get("desiredStatus") == "RUNNING" and pod.get("runtime", {}).get("ports"):
+            status = pod.get("desiredStatus") if pod else "?"
+            runtime = (pod or {}).get("runtime") or {}
+            ports = runtime.get("ports") or []
+            if status == "RUNNING" and ports:
+                print(f"  pod RUNNING after {(i+1)*10}s")
                 break
+            if i % 6 == 5:
+                print(f"  [{(i+1)*10}s] status={status} ports={len(ports)}")
         else:
             terminate_pod(api_key, pod_id)
-            return RunResult(cfg, "timeout", error="pod never reached RUNNING state")
+            return RunResult(cfg, "timeout", error=f"pod never reached RUNNING (last status={status})")
 
         ssh_port = None
         ssh_host = None
-        for p in pod["runtime"]["ports"]:
-            if p["privatePort"] == 22 and p.get("isIpPublic"):
-                ssh_port = p["publicPort"]
-                ssh_host = p["ip"]
+        runtime = (pod or {}).get("runtime") or {}
+        for p in (runtime.get("ports") or []):
+            if p.get("privatePort") == 22 and p.get("isIpPublic"):
+                ssh_port = p.get("publicPort")
+                ssh_host = p.get("ip")
         if ssh_port is None:
             terminate_pod(api_key, pod_id)
             return RunResult(cfg, "failed", error="no public SSH port")
@@ -304,6 +337,8 @@ def main() -> int:
     ap.add_argument("--budget-usd", type=float, default=None,
                     help="Hard cap on total spend. Without this, print matrix and exit.")
     ap.add_argument("--include-moe", action="store_true")
+    ap.add_argument("--smoke", action="store_true",
+                    help="Smoke-test: run only the cheapest config (RTX-4090) to validate the pipeline")
     ap.add_argument("--ssh-key", default="~/.ssh/id_ed25519",
                     help="SSH key path to give RunPod (must be added in console).")
     ap.add_argument("--out-dir", default="docs/validation_results")
@@ -312,6 +347,9 @@ def main() -> int:
     matrix = list(DEFAULT_MATRIX)
     if args.include_moe:
         matrix += MOE_MATRIX
+    if args.smoke:
+        # Just the cheapest config — smallest supply-constraint risk too.
+        matrix = [c for c in matrix if c.gpu_db_key == "RTX-4090"] or matrix[:1]
     print_matrix_summary(matrix)
 
     total_cost = sum(c.estimated_cost_usd for c in matrix)
