@@ -181,11 +181,16 @@ def create_pod(
         env_vars.append({"key": "PUBLIC_KEY", "value": pubkey})
     last_err: Exception | None = None
     for ct in cloud_types_to_try:
+        # Disk sizing: 7B-8B fp16 models are ~15-16 GB; plus HF download buffer
+        # (safetensors → model cache ≈ 2×), plus pip cache, plus vllm CUDA
+        # kernels. 60 GB volume comfortably fits one model; 30 GB container
+        # disk holds /usr + pip installs. Smaller == "No space left on device"
+        # during HF download (confirmed failure mode on a 30 GB volume).
         variables = {"input": {
             "cloudType": ct,
             "gpuCount": 1,
-            "volumeInGb": 30,
-            "containerDiskInGb": 20,
+            "volumeInGb": 60,
+            "containerDiskInGb": 30,
             "minVcpuCount": 2,
             "minMemoryInGb": 16,
             "gpuTypeId": gpu_type,

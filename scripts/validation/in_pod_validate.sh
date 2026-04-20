@@ -59,6 +59,16 @@ else
     log "WARNING: HF_TOKEN is NOT set — gated models will 401"
 fi
 
+# Put HuggingFace cache on the /workspace volume (60 GB) rather than the
+# container disk (30 GB, partially consumed by pip installs). This is the
+# specific fix for "No space left on device" seen on smoke v5.
+export HF_HOME="$WORK_DIR/hf-cache"
+export TRANSFORMERS_CACHE="$HF_HOME"
+export HF_HUB_CACHE="$HF_HOME"
+mkdir -p "$HF_HOME"
+log "HF_HOME=$HF_HOME"
+df -h "$WORK_DIR" /root 2>/dev/null || true
+
 # kv-planner itself (already checked out before calling this script)
 if [ -d "$REPO_DIR/src/kv_planner" ]; then
     python3 -m pip install --quiet -e "$REPO_DIR[tui]"
