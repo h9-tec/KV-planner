@@ -132,16 +132,59 @@ implementations do not).
 
 ---
 
-## 4. Planned — how this page grows
+## 4. How this page grows
+
+### Pending: RunPod validation campaign (harness ready, awaiting run)
+
+The [`scripts/validation/`](scripts/validation/) harness can run
+kv-planner predictions against live vLLM servers on rented GPUs and
+write structured result JSONs for every (GPU × model × precision)
+configuration.
+
+Default matrix (~$3.50 estimated RunPod spend):
+
+| GPU | Model | Precision | Est. min | Est. $ |
+|---|---|---|---:|---:|
+| H100-SXM-80GB | Llama-3-8B | fp16 | 18 | $1.20 |
+| H100-SXM-80GB | Qwen2.5-7B | fp16 | 18 | $1.20 |
+| A100-PCIe-80GB | Llama-3-8B | fp16 | 18 | $0.57 |
+| L40S | Llama-3-8B | fp16 | 18 | $0.36 |
+| RTX-4090 | Llama-3-8B | fp16 | 18 | $0.13 |
+
+Extended MoE matrix adds Mixtral-8x7B on H100 (~$2 more).
+
+Reproduction (two paths documented in
+[`scripts/validation/README.md`](scripts/validation/README.md)):
+
+```bash
+# Path A — fully automated with RunPod API
+export RUNPOD_API_KEY=... HF_TOKEN=...
+python scripts/validation/runpod_orchestrator.py --budget-usd 25
+python scripts/validation/aggregate_results.py
+
+# Path B — manual one-pod-at-a-time
+# (SSH into a RunPod pod, run in_pod_validate.sh, scp result back)
+```
+
+Each pod runs `scripts/validation/in_pod_validate.sh` which installs
+vLLM, serves the target model, hits it with `kv-planner loadtest`,
+back-solves MBU with `kv-planner calibrate`, and emits one JSON
+containing: config, predicted numbers, measured numbers,
+calibration-derived MBU, and MAPE (TPOT + throughput).
+
+**As of this commit the campaign has not been run.** When it does, this
+section gets replaced by the measured table.
+
+### Roadmap beyond this campaign
 
 | Milestone | What gets added |
 |---|---|
-| **0.3.1** | Published vLLM / SGLang benchmark points for H100 TP1/TP8 and A100 SXM 80 GB as regression fixtures. No new measurements from us — reference-number comparison only. |
-| **0.4.0** | Actual end-to-end load tests on at least 2 enterprise GPUs via RunPod/Lambda cloud rentals. Target: H100 PCIe + A100 SXM. |
-| **0.5.0** | 5+ GPU measurement set with Mixtral + Qwen3-MoE. Mutation-testing audit of the roofline test suite. MAPE table shipped as CI artifact. |
+| **0.4.0** | MoE campaign (Mixtral / Qwen3-30B-A3B / DeepSeek-V2-Lite); chunked-prefill modeling; SGLang runtime support alongside vLLM. |
+| **0.5.0** | Disaggregated prefill/decode planner; mutation-testing audit of the roofline test suite. |
 
-Until 0.5.0 lands, treat kv-planner as a **research prototype** with a
-well-cited physics engine but narrow empirical coverage.
+Until the RunPod campaign lands with real H100 / A100 / L40S MAPE
+numbers, kv-planner remains a **research prototype** — well-cited
+physics engine, narrow empirical coverage.
 
 ---
 
