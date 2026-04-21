@@ -385,6 +385,8 @@ def main() -> int:
     ap.add_argument("--budget-usd", type=float, default=None,
                     help="Hard cap on total spend. Without this, print matrix and exit.")
     ap.add_argument("--include-moe", action="store_true")
+    ap.add_argument("--moe-only", action="store_true",
+                    help="Run only MOE_MATRIX, skip the dense matrix")
     ap.add_argument("--smoke", action="store_true",
                     help="Smoke-test: run only the cheapest config (RTX-4090) to validate the pipeline")
     ap.add_argument("--ssh-key", default="~/.ssh/id_ed25519",
@@ -392,9 +394,12 @@ def main() -> int:
     ap.add_argument("--out-dir", default="docs/validation_results")
     args = ap.parse_args()
 
-    matrix = list(DEFAULT_MATRIX)
-    if args.include_moe:
-        matrix += MOE_MATRIX
+    if args.moe_only:
+        matrix = list(MOE_MATRIX)
+    else:
+        matrix = list(DEFAULT_MATRIX)
+        if args.include_moe:
+            matrix += MOE_MATRIX
     if args.smoke:
         # Cheapest GPU + non-gated model so smoke doesn't depend on HF Meta
         # gate access. Qwen2.5-7B is freely downloadable + well-tested on vLLM.
