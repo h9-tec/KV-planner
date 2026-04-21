@@ -85,12 +85,15 @@ DEFAULT_MATRIX: list[Config] = [
 ]
 
 
-# Extended MoE matrix — enable with --include-moe. 70B and Mixtral need
-# more VRAM or multi-GPU; skip laptops.
+# Extended MoE matrix — enable with --include-moe.
+# Model choice:
+#  - Mixtral-8x7B fp16 = 93.4 GB → does NOT fit 80 GB H100 (would need TP=2).
+#  - Qwen3-30B-A3B fp16 = 60 GB → tight on 80 GB H100, OOMs with full KV.
+#  - DeepSeek-V2-Lite fp16 = 31 GB → fits comfortably, non-gated, MLA.
 MOE_MATRIX: list[Config] = [
     Config("NVIDIA H100 80GB HBM3", "H100-SXM-80GB",
-           "mistralai/Mixtral-8x7B-Instruct-v0.1", "mixtral-8x7b",
-           precision="fp16", estimated_pod_minutes=30, estimated_hourly_usd=3.99),
+           "deepseek-ai/DeepSeek-V2-Lite", "deepseek-v2-lite",
+           precision="fp16", estimated_pod_minutes=25, estimated_hourly_usd=3.99),
 ]
 
 
