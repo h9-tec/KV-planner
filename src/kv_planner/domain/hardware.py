@@ -39,6 +39,13 @@ class HardwareSpec:
         gpu_memory_utilization: Fraction of GPU memory to use (0-1)
         block_size: KV cache block size in tokens (vLLM PagedAttention)
         gpu_hourly_cost: On-demand GPU cost per hour (optional, for TCO)
+        kernel_launch_overhead_us: Amortised per-kernel launch latency on
+            this GPU (microseconds). Used by the MoE routing-overhead term
+            in the Roofline decode model, which launches many small GEMMs
+            per token instead of a few large ones. Defaults are empirical
+            (H100 ≈ 18 μs, A100 ≈ 22 μs, consumer Ada ≈ 25 μs); override
+            if `kv-planner calibrate` derives a different value for a
+            specific runtime.
     """
 
     gpu_model: str
@@ -62,6 +69,12 @@ class HardwareSpec:
     block_size: int = 16
 
     gpu_hourly_cost: Optional[float] = None
+
+    # Empirical default tuned against DeepSeek-V2-Lite × H100 × vLLM
+    # (see BENCHMARKS.md "MoE validation" section). Only used for MoE
+    # models; dense models ignore it (their roofline is already within
+    # ~2% of measured on enterprise GPUs).
+    kernel_launch_overhead_us: float = 18.0
 
     def __post_init__(self) -> None:
         """Validate invariants."""
