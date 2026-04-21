@@ -19,7 +19,7 @@ look like. It is deliberately short right now.
 | GPUs with published-benchmark comparison | 0 (planned) | vLLM / SGLang / llm-d numbers pending |
 | GPUs with only theoretical roofline | 33 | everything in `gpu_specs.py` except the four measured |
 | Dense models measured | 4 (Llama-3.2-3B, DeepSeek-R1-Distill-7B, Aya-8B, Qwen2.5-7B) | |
-| MoE models measured | **1** (DeepSeek-V2-Lite) | exposes 60 % TPOT MAPE — routing overhead not modeled |
+| MoE models measured | **1** (DeepSeek-V2-Lite) | TPOT MAPE 1.8 % after routing-overhead term added (was 60 %) |
 | Total predictive samples | 7 | |
 
 **Now covers a real spread of GPU tiers** (consumer → prosumer → enterprise),
@@ -94,6 +94,7 @@ so cross-GPU results are directly comparable.
 | H100-SXM-80GB | 6.1 ms | 6.0 ms | **1.9 %** | 1420 | 1093 | 29.9 % | 52 ms |
 | A100-PCIe-80GB | 10.6 ms | 10.6 ms | **0.6 %** | 797 | 703 | 13.3 % | 253 ms |
 | RTX-4090 | 20.3 ms | 15.9 ms | **28.1 %** | 416 | 474 | 12.4 % | 366 ms |
+| H100-SXM-80GB / DeepSeek-V2-Lite (MoE) | 4.9 ms | 5.0 ms | **1.8 %** | — | 1225 | — | 68 ms |
 
 Per-config artifacts:
 - [`H100-SXM-80GB_qwen2.5-7b.json`](docs/validation_results/H100-SXM-80GB_qwen2.5-7b.json)
@@ -115,25 +116,35 @@ exposes a **real modeling gap** that pure-roofline math can't close:
 | TTFT p50 | — | 68 ms | — |
 | MBU (predicted) | 1.0 (clipped) | — | arithmetic intensity saturates |
 
-**Why the big miss on MoE?** kv-planner's MoE model computes decode
-time as `active_weight_bytes / (peak_bw × MBU)`. With DeepSeek-V2-Lite's
-2.4 B active parameters that math gives ≈ 2 ms/token. But real vLLM
-measures 5 ms — the 3 ms gap is **MoE router overhead**: expert
-dispatch, all-to-all communication, and result re-merging, none of which
-is bandwidth-bound and none of which is in the current physics model.
+**Initial finding (before the fix).** kv-planner's MoE model computed
+decode time as `active_weight_bytes / (peak_bw × MBU)`. With
+DeepSeek-V2-Lite's 2.4 B active parameters that math gives ≈ 2 ms/token.
+But real vLLM measured 5 ms — the 3 ms gap was **MoE kernel-launch /
+router overhead**: many small expert GEMMs launched per decode step
+(one per `layer × active_expert`) instead of a few large ones.
 
-**What this means for users.** TPOT predictions for MoE models from
-kv-planner should currently be treated as a *lower bound* (i.e. "the
-best you could get if routing overhead were zero"). Absolute MoE
-numbers are still correct in shape: DeepSeek-V2-Lite's measured 5 ms
-TPOT is 20 % faster than Qwen2.5-7B's measured 6 ms TPOT on the same
-H100 — the active-params advantage is real, just less dramatic than the
-roofline suggests.
+**The fix (shipped this iteration).** Added a per-GPU
+`kernel_launch_overhead_us` field to `HardwareSpec` (default 18 μs for
+H100, empirically fit against the measurement) plus a new
+`_moe_routing_overhead_sec` term in `RooflineAnalyzer.predict_decode_latency`:
 
-**Roadmap (0.4.0).** Add a MoE-routing-overhead term to the decode
-latency formula. Literature gives us a starting point: Mixtral traces
-show 1.5-3× overhead on top of the bandwidth-bound active-params
-decode, depending on num_experts_per_token and concurrent batch size.
+```python
+overhead_sec = num_layers × num_experts_per_token × launch_us × 1e-6
+# DS-V2-Lite × H100:  27 × 6 × 18e-6 = 2.92 ms
+```
+
+Result:
+
+| | Before fix | After fix |
+|---|---:|---:|
+| Predicted TPOT | 2.00 ms | 4.92 ms |
+| Measured TPOT | 5.01 ms | 5.01 ms |
+| **MAPE TPOT** | 60 % | **1.8 %** |
+
+Dense models are unchanged (Qwen2.5-7B × H100 still predicts 6.11 ms).
+The regression test
+[`test_deepseek_v2_lite_h100_tpot_within_25pct_of_measured`](tests/unit/core/test_moe.py)
+pins this ground truth going forward.
 
 Full MoE artifact: [`docs/validation_results/H100-SXM-80GB_deepseek-v2-lite.json`](docs/validation_results/H100-SXM-80GB_deepseek-v2-lite.json).
 

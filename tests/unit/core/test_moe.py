@@ -78,3 +78,50 @@ def test_four_moe_models_in_catalog():
     from kv_planner.infrastructure.model_catalog import CATALOG
     catalog_moe = {e.slug for e in CATALOG if e.config.is_moe}
     assert slugs <= catalog_moe, f"missing: {slugs - catalog_moe}"
+
+
+# ---------------------------------------------------------------------------
+# MoE routing-overhead ground-truth regression
+#
+# Pinned against the DeepSeek-V2-Lite × H100-SXM-80GB × vLLM 0.19.1
+# measurement in BENCHMARKS.md (docs/validation_results/
+# H100-SXM-80GB_deepseek-v2-lite.json):
+#
+#   config:   input=2048  output=256  concurrency=8  batch_size=8  precision=fp16
+#   predicted TPOT (bandwidth-only): 2.00 ms
+#   measured  TPOT (vLLM p50):       5.01 ms
+#   routing-overhead gap:            3.01 ms
+#
+# Once `_moe_routing_overhead_sec` is implemented, this test pins the
+# overall TPOT prediction within ±25 % of measured. 25 % not 5 % because
+# we have exactly one MoE data point; tighten as more MoE configs land.
+# ---------------------------------------------------------------------------
+
+def test_deepseek_v2_lite_h100_tpot_within_25pct_of_measured():
+    """After MoE routing fix, predicted TPOT should match measured 5.0 ms ±25 %."""
+    ra = RooflineAnalyzer()
+    gpu = GPUDatabase.to_hardware_spec("H100-SXM-80GB")
+    cfg = by_slug("deepseek-v2-lite").config
+
+    MEASURED_TPOT_MS = 5.01  # vLLM p50, see BENCHMARKS.md
+
+    result = ra.predict_latency(
+        cfg, gpu, batch_size=8,
+        input_length=2048, output_length=256, precision="fp16",
+    )
+    per_token_ms = result.decode_latency_ms / 256
+
+    relative_error = abs(per_token_ms - MEASURED_TPOT_MS) / MEASURED_TPOT_MS
+    assert relative_error < 0.25, (
+        f"MoE TPOT prediction off by {relative_error*100:.0f}% "
+        f"(predicted {per_token_ms:.2f} ms, measured {MEASURED_TPOT_MS:.2f} ms)"
+    )
+
+
+def test_moe_routing_overhead_is_zero_for_dense_models():
+    """The new overhead term must not perturb dense predictions."""
+    ra = RooflineAnalyzer()
+    gpu = GPUDatabase.to_hardware_spec("H100-SXM-80GB")
+    qwen = by_slug("qwen2.5-7b").config
+    overhead_sec = ra._moe_routing_overhead_sec(qwen, gpu, batch_size=8)
+    assert overhead_sec == 0.0, "dense models must have zero routing overhead"

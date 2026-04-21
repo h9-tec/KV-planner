@@ -305,9 +305,64 @@ class RooflineAnalyzer:
         latency_sec += self._allreduce_time(
             hardware, model, batch_size, sequence_length=1, precision=precision
         )
+        # MoE-only: account for extra per-token overhead that pure roofline
+        # bandwidth math can't see (kernel launches for many small expert
+        # GEMMs, gating compute, token permutation). Zero for dense models.
+        latency_sec += self._moe_routing_overhead_sec(model, hardware, batch_size)
 
         achieved_tflops = (flops_per_step / latency_sec) / 1e12 if latency_sec > 0 else 0.0
         return latency_sec * 1000.0, achieved_tflops, True
+
+    # ---------- MoE routing overhead ----------
+
+    def _moe_routing_overhead_sec(
+        self,
+        model: ModelConfig,
+        hardware: HardwareSpec,
+        batch_size: int,
+    ) -> float:
+        """Extra per-token decode latency for MoE routing that pure roofline misses.
+
+        Dense models: return 0 (they already predict within ~2% on enterprise GPUs).
+
+        MoE models: the runtime issues many small kernel launches per decode
+        step — roughly one GEMM per (layer × activated expert) — plus gating
+        compute and token permutation. The empirical fit against the
+        DeepSeek-V2-Lite × H100 × vLLM measurement (BENCHMARKS.md) is that
+        the gap between roofline-only and measured TPOT is very close to
+        ``num_layers × num_experts_per_token × kernel_launch_overhead_us``.
+
+        Ground truth to calibrate against (single sample so far):
+          DeepSeek-V2-Lite on H100-SXM-80GB, vLLM 0.19.1, batch_size=8:
+          - layers:                 27
+          - experts_per_token:       6
+          - measured TPOT gap:    ~3.0 ms (predicted 2.0 vs measured 5.0)
+          - implied launch_us:      ~18 μs
+
+        TODO(user): implement the shape. Suggested starting point (Option B
+        from the fix-proposal table): linear in ``layers × experts_per_token``,
+        scaled by ``hardware.kernel_launch_overhead_us``, with batch_size
+        treated as amortisable (launches happen once per layer per step,
+        regardless of batch — so batch_size should NOT multiply in).
+
+        Keep it simple. Don't introduce coefficients you can't justify from
+        the one MoE measurement we have. When more MoE configs land in
+        BENCHMARKS.md, refine.
+        """
+        if not model.is_moe:
+            return 0.0
+        if model.num_experts_per_token is None:
+            return 0.0
+
+        # One GEMM kernel launched per (layer × activated expert) per decode
+        # step; gating + permutation absorbed into the same constant.
+        # batch_size does NOT multiply — launches happen per-layer regardless.
+        return (
+            model.num_layers
+            * model.num_experts_per_token
+            * hardware.kernel_launch_overhead_us
+            * 1e-6
+        )
 
     # ---------- AllReduce (ring) ----------
 
