@@ -97,10 +97,6 @@ def test_four_moe_models_in_catalog():
 # we have exactly one MoE data point; tighten as more MoE configs land.
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    reason="MoE routing-overhead term not implemented yet — see roofline.py",
-    strict=True,
-)
 def test_deepseek_v2_lite_h100_tpot_within_25pct_of_measured():
     """After MoE routing fix, predicted TPOT should match measured 5.0 ms ±25 %."""
     ra = RooflineAnalyzer()

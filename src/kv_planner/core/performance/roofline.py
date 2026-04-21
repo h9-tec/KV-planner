@@ -354,11 +354,15 @@ class RooflineAnalyzer:
         if model.num_experts_per_token is None:
             return 0.0
 
-        # ---- TODO(user): implement the shape here (≤ 5 lines) ----
-        # Available: model.num_layers, model.num_experts_per_token,
-        #            hardware.kernel_launch_overhead_us, batch_size
-        # Returning 0.0 keeps current behaviour (under-predicts MoE TPOT).
-        return 0.0
+        # One GEMM kernel launched per (layer × activated expert) per decode
+        # step; gating + permutation absorbed into the same constant.
+        # batch_size does NOT multiply — launches happen per-layer regardless.
+        return (
+            model.num_layers
+            * model.num_experts_per_token
+            * hardware.kernel_launch_overhead_us
+            * 1e-6
+        )
 
     # ---------- AllReduce (ring) ----------
 
