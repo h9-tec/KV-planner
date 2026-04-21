@@ -11,14 +11,17 @@ principles, with a formula and a citation for every number.
 [![status: Research Preview](https://img.shields.io/badge/status-Research%20Preview-eb6e88.svg)](#honest-limitations)
 
 > **Status: Research Preview.** Physics engine validated end-to-end on
-> **4 GPUs** so far — RTX 5060 Laptop (Ollama) and H100-SXM-80GB,
-> A100-PCIe-80GB, RTX-4090 (vLLM on RunPod). On enterprise GPUs the
-> default memory-efficiency assumption predicts per-token latency within
-> **2 %** MAPE; on consumer Ada (4090) MBU needs calibrating down to
-> ~0.59 (`kv-planner calibrate` does this automatically). L40S + MoE
-> campaigns pending. See [`BENCHMARKS.md`](BENCHMARKS.md) for the full
-> validation ledger and [Honest limitations](#honest-limitations) below
-> before sizing a production cluster based solely on kv-planner's output.
+> **4 GPUs + 1 MoE model** — RTX 5060 Laptop (Ollama), H100-SXM-80GB,
+> A100-PCIe-80GB, RTX-4090 (vLLM on RunPod), DeepSeek-V2-Lite MoE (H100,
+> vLLM). On **dense** models at enterprise GPUs, default settings predict
+> per-token latency within **2 %** MAPE. On consumer Ada (4090) MBU
+> needs calibrating down to ~0.59 (`kv-planner calibrate` does this
+> automatically). On **MoE** models, current pure-roofline math
+> under-predicts TPOT by ~60 % because router overhead isn't modeled
+> yet — treat MoE predictions as a *lower bound*; fix coming in 0.4.0.
+> See [`BENCHMARKS.md`](BENCHMARKS.md) for the full validation ledger and
+> [Honest limitations](#honest-limitations) below before sizing a
+> production cluster based solely on kv-planner's output.
 
 ![kv-planner native GUI](docs/screenshots/gui-01-overview.png)
 
@@ -168,14 +171,17 @@ actually validated and what isn't:
 
 ### What's validated (and what isn't)
 
-- **4-GPU validation sample.** End-to-end measurements now cover:
-  RTX 5060 Laptop (Ollama), RTX-4090, A100-PCIe-80GB, H100-SXM-80GB
-  (vLLM on RunPod). See [`BENCHMARKS.md`](BENCHMARKS.md) for the
-  full ledger. TPOT MAPE on enterprise GPUs is **< 2 %** at default
+- **4-GPU + 1-MoE validation sample.** End-to-end measurements now
+  cover: RTX 5060 Laptop (Ollama), RTX-4090, A100-PCIe-80GB,
+  H100-SXM-80GB (vLLM on RunPod), plus DeepSeek-V2-Lite MoE on H100.
+  See [`BENCHMARKS.md`](BENCHMARKS.md) for the full ledger. TPOT
+  MAPE on dense models at enterprise GPUs is **< 2 %** at default
   settings; consumer-Ada needs `kv-planner calibrate` to drop MBU
-  to ~0.59. L40S, MI300X, and all MoE models still have **zero
-  measured** validation — predictions for those are theoretical
-  roofline output only.
+  to ~0.59. MoE models hit **60 % MAPE** today because the model
+  doesn't yet include expert-routing overhead — treat MoE predictions
+  as a lower bound. L40S, MI300X, larger MoE (Mixtral / Qwen3-30B-A3B)
+  still have **zero measured** validation — predictions for those are
+  theoretical roofline output only.
 - **Prefix-cache hit rate is an INPUT, not a prediction.** The
   `PrefixCachingAnalyzer` takes `hit_rate` as a parameter (the user
   provides it from their own workload trace). The included
@@ -1049,14 +1055,18 @@ input=2048 output=256 concurrency=8**, and cost $2.25 total:
 | H100-SXM-80GB | 6.1 ms | 6.0 ms | **1.9 %** |
 | A100-PCIe-80GB | 10.6 ms | 10.6 ms | **0.6 %** |
 | RTX-4090 (community) | 20.3 ms | 15.9 ms | **28.1 %** |
+| H100-SXM-80GB / DeepSeek-V2-Lite (MoE) | 2.0 ms | 5.0 ms | **60.0 %** |
 
-**On enterprise GPUs, default MBU=0.75 predicts per-token latency
+**On dense models at enterprise GPUs, default MBU=0.75 predicts TPOT
 within 2 %.** On consumer Ada (4090) the realised MBU is ~0.59 —
-`kv-planner calibrate` derives that automatically. Per-config JSONs
-live under `docs/validation_results/`; see
-[`BENCHMARKS.md`](BENCHMARKS.md) for the full honest ledger including
-throughput MAPE, reproducibility details, and what's still
-unvalidated (L40S, MI300X, MoE models).
+`kv-planner calibrate` derives that automatically. On **MoE**,
+pure-roofline math under-predicts TPOT because expert-routing
+overhead isn't modeled; the predicted 2.0 ms is the bandwidth-only
+lower bound and the real 5.0 ms adds ~3 ms of router/dispatch work.
+Fix (routing-overhead term) lined up for 0.4.0. Per-config JSONs live
+under `docs/validation_results/`; see [`BENCHMARKS.md`](BENCHMARKS.md)
+for the full honest ledger including throughput MAPE, reproducibility
+details, and what's still unvalidated (L40S, MI300X, more MoE models).
 
 ## Development
 
